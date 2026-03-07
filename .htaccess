@@ -1,0 +1,34 @@
+# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION BEGIN
+PassengerAppRoot "/home/mojaloop/dfsp2.mojaloop.xyz"
+PassengerBaseURI "/"
+PassengerNodejs "/home/mojaloop/nodevenv/dfsp2.mojaloop.xyz/22/bin/node"
+PassengerAppType node
+PassengerStartupFile index.js
+# DO NOT REMOVE. CLOUDLINUX PASSENGER CONFIGURATION END
+# DO NOT REMOVE OR MODIFY. CLOUDLINUX ENV VARS CONFIGURATION BEGIN
+<IfModule Litespeed>
+SetEnv ALS_ADMIN_SERVICE https://als-admin.mojaloop.xyz
+SetEnv ALS_SERVICE https://als.mojaloop.xyz
+SetEnv CENTRAL_LEDGER https://ledger.mojaloop.xyz
+SetEnv DATABASE mojaloop_dfsp_2
+SetEnv HOST localhost
+SetEnv JWT_EXPIRES_IN 365d
+SetEnv JWT_REFRESH_EXPIRES_IN 365d
+SetEnv JWT_SECRET 4hhh655y53343b54ahtr5trh4556nrtj6u4a
+SetEnv ML_API_ADAPTER https://api.mojaloop.xyz
+SetEnv JWT_REFRESH_SECRET 53aa55y533athtrjhrtsab54ahtr5trh4556nrtj6uthsea
+SetEnv NODE_ENV production
+SetEnv PASSWORD zd(lPk41Nl5B2XI]
+SetEnv PORT 5400
+SetEnv QUOTE_SERVICE https://quoting.mojaloop.xyz
+SetEnv SERVER_URL https://dfsp2.mojaloop.xyz
+SetEnv SETTLEMENT https://settlement.mojaloop.xyz
+SetEnv SMTP_HOST mail.saskarentpay.xdomainhost.com
+SetEnv SMTP_PASSWORD Z7W!KZi@bKvh[&)8
+SetEnv SMTP_USER admin@saskarentpay.xdomainhost.com
+SetEnv USER mojaloop_dfsp_2
+SetEnv currency BDT
+SetEnv fspDes ABank
+SetEnv fspId BBank
+</IfModule>
+# DO NOT REMOVE OR MODIFY. CLOUDLINUX ENV VARS CONFIGURATION END
