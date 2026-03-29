@@ -239,7 +239,7 @@ const getTransactionSummary = async (req, res) => {
     const rows = await queryDB(summarySQL, params);
 
     // ── Structure: one card per type ─────────────────────────
-    const TYPES = ['P2P', 'INSTANT', 'BULK', 'NBPS', 'RTGS', 'BEFTN'];
+    const TYPES = ['P2P', 'INSTANT', 'BULK', 'NPSB', 'RTGS', 'BEFTN'];
 
     const cards = {};
 
@@ -480,7 +480,7 @@ const getMerchantDashboard = async (req, res) => {
     );
 
     // Normalize into { P2P: { send:{}, receive:{} }, ... }
-    const TYPE_LIST = ['P2P', 'INSTANT', 'BULK', 'NBPS', 'RTGS', 'BEFTN'];
+    const TYPE_LIST = ['P2P', 'INSTANT', 'BULK', 'NPSB', 'RTGS', 'BEFTN'];
     const empty = () => ({
       total: 0,
       committed: 0,

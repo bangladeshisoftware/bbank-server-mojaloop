@@ -1407,7 +1407,7 @@ app.post('/api/init-quotes', async (req, res) => {
           initiator: 'PAYER',
           initiatorType: 'CONSUMER',
         },
-        NBPS: {
+        NPSB: {
           scenario: 'PAYMENT',
           initiator: 'PAYER',
           initiatorType: 'CONSUMER',
