@@ -26,11 +26,11 @@ const getTransactions = async (req, res) => {
     const user = req.user;
     // if user.role=='MERCHANT', then query user.merchant_id
 
-    // ── Pagination ────────────────────────────────────────────
+    //  Pagination
     const limit = Math.min(Math.max(parseInt(per_page) || 20, 1), 100);
     const offset = (Math.max(parseInt(page) || 1, 1) - 1) * limit;
 
-    // ── Build WHERE clauses dynamically ──────────────────────
+    // Build WHERE clauses dynamically
     const conditions = [];
     const params = [];
 
@@ -87,7 +87,7 @@ const getTransactions = async (req, res) => {
     const whereClause =
       conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // ── Count total matching rows ─────────────────────────────
+    // Count total matching rows
     const countSQL = `
       SELECT COUNT(*) AS total
       FROM transactions t
@@ -97,7 +97,7 @@ const getTransactions = async (req, res) => {
     const total = countResult[0]?.total || 0;
     const total_pages = Math.ceil(total / limit);
 
-    // ── Fetch paginated rows ──────────────────────────────────
+    // Fetch paginated rows 
     const dataSQL = `
       SELECT
         t.id,
@@ -145,7 +145,7 @@ const getTransactions = async (req, res) => {
     const dataParams = [...params, limit, offset];
     const rows = await queryDB(dataSQL, dataParams);
 
-    // ── Response ──────────────────────────────────────────────
+    // Response
     return res.status(200).json({
       success: true,
       data: rows,
@@ -207,7 +207,7 @@ const getTransactionSummary = async (req, res) => {
     const whereBase =
       conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // ── Per-type aggregation in a single query ────────────────
+    // Per-type aggregation in a single query
     const summarySQL = `
       SELECT
         type,
@@ -238,7 +238,7 @@ const getTransactionSummary = async (req, res) => {
 
     const rows = await queryDB(summarySQL, params);
 
-    // ── Structure: one card per type ─────────────────────────
+    // Structure: one card per type
     const TYPES = ['P2P', 'INSTANT', 'BULK', 'NPSB', 'RTGS', 'BEFTN'];
 
     const cards = {};
@@ -296,7 +296,7 @@ const getTransactionSummary = async (req, res) => {
       };
     }
 
-    // ── Grand total across all types ─────────────────────────
+    // Grand total across all types
     const allRows = rows;
     const grand = {
       total_count: allRows.reduce((s, r) => s + Number(r.total_count), 0),
@@ -317,8 +317,8 @@ const getTransactionSummary = async (req, res) => {
       success: true,
       summary: {
         grand_total: grand,
-        cards, // keyed by type: cards.P2P, cards.RTGS, etc.
-        cards_array: Object.values(cards), // array version for easy frontend loop
+        cards,
+        cards_array: Object.values(cards),
       },
       filters: {
         date_from: date_from || null,
@@ -327,7 +327,6 @@ const getTransactionSummary = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('[TXN] getTransactionSummary error:', error);
     return res.status(500).json({
       success: false,
       message: 'Internal server error',
@@ -362,7 +361,6 @@ const getTransactionById = async (req, res) => {
 
     return res.status(200).json({ success: true, data: rows[0] });
   } catch (error) {
-    console.error('[TXN] getTransactionById error:', error);
     return res.status(500).json({
       success: false,
       message: 'Internal server error',
@@ -384,7 +382,6 @@ const getMerchantDashboard = async (req, res) => {
         });
       }
     } else {
-      // ADMIN can pass ?merchant_id= to inspect any merchant
       merchantId = req.query.merchant_id || null;
       if (!merchantId) {
         return res
@@ -479,7 +476,6 @@ const getMerchantDashboard = async (req, res) => {
       [merchantId],
     );
 
-    // Normalize into { P2P: { send:{}, receive:{} }, ... }
     const TYPE_LIST = ['P2P', 'INSTANT', 'BULK', 'NPSB', 'RTGS', 'BEFTN'];
     const empty = () => ({
       total: 0,
@@ -577,7 +573,6 @@ const getMerchantDashboard = async (req, res) => {
       recent,
     });
   } catch (err) {
-    console.error('[TXN] getMerchantDashboard:', err);
     return res.status(500).json({ error: err.message });
   }
 };

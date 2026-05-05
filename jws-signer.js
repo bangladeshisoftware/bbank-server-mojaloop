@@ -9,9 +9,9 @@ let nagadPrivateKey;
 try {
   bkashPrivateKey = fs.readFileSync('./keys/bkash-private.pem', 'utf8');
   nagadPrivateKey = fs.readFileSync('./keys/nagad-private.pem', 'utf8');
-  console.log('✅ Private keys loaded successfully');
+  console.log('Private keys loaded successfully');
 } catch (error) {
-  console.error('❌ Error loading private keys:', error.message);
+  console.error('Error loading private keys:', error.message);
 }
 
 function generateJWSSignature(body, httpMethod, uri, source, destination, date) {
@@ -63,12 +63,12 @@ function generateJWSSignature(body, httpMethod, uri, source, destination, date) 
       protectedHeader: encodedProtectedHeader
     });
 
-    console.log(`✅ JWS Signature generated for ${source}`);
+    console.log(`JWS Signature generated for ${source}`);
     
     return jwsSignature;
 
   } catch (error) {
-    console.error("❌ Error generating JWS signature:", error.message);
+    console.error("Error generating JWS signature:", error.message);
     throw error;
   }
 }

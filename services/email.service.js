@@ -1,38 +1,18 @@
-
 const nodemailer = require('nodemailer');
 
 //  EMAIL TRANSPORTER
-/*
-function createTransporter() {
-  const port = parseInt(process.env.SMTP_PORT || '465');
 
-  return nodemailer.createTransport({
-    host:   process.env.SMTP_HOST,
-    port:   port,
-    secure: port === 465,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS,
-    },
-    family: 4,                        // ← IPv4 force (cPanel এ must)
-    tls:    { rejectUnauthorized: false }, // ← self-signed cert allow
-    connectionTimeout: 15000,
-    greetingTimeout:   10000,
-    socketTimeout:     15000,
-  });
-}
-*/
 function createTransporter() {
   const port = parseInt(process.env.SMTP_PORT || '587');
   const is465 = port === 465;
 
   return nodemailer.createTransport({
-    host: process.env.SMTP_HOST || "mail.saskarentpay.xdomainhost.com",
+    host: process.env.SMTP_HOST || 'your-smtp-host.com',
     port,
     secure: is465,
     auth: {
-      user: process.env.SMTP_USER || "admin@saskarentpay.xdomainhost.com",
-      pass: "Z7W!KZi@bKvh[&)8",
+      user: process.env.SMTP_USER || 'your-smtp-user@domain.com',
+      pass: process.env.SMTP_PASS || 'password',
     },
     family: 4,
     requireTLS: !is465,
@@ -44,17 +24,10 @@ function createTransporter() {
 
 //  BASE SEND EMAIL FUNCTION (reusable)
 async function sendEmail({ to, subject, html, text }) {
-/*  if (!process.env.SMTP_USER || !process.env.SMTP_PASS) {
-    console.warn('[EMAIL] SMTP_USER or SMTP_PASS not set — email skipped');
-    return { skipped: true, reason: 'SMTP not configured' };
-  }
-  */
-
   const transporter = createTransporter();
 
   const mailOptions = {
-    from:
-       '"DFSP Portal" <admin@saskarentpay.xdomainhost.com>',
+    from: `"DFSP Portal" <${process.env.SMTP_HOST || 'your-smtp-host.com'}>`,
     to,
     subject,
     html,
@@ -216,8 +189,8 @@ background-image: linear-gradient(120deg, #a1c4fd 0%, #c2e9fb 100%);
         </div>
 
         <div class="warning">
-          ⏱ This OTP is valid for <strong>10 minutes</strong> only.<br/>
-          🔐 Never share this code with anyone.<br/>
+        This OTP is valid for <strong>10 minutes</strong> only.<br/>
+         Never share this code with anyone.<br/>
           If you did not request this login, please ignore this email or contact support immediately.
         </div>
 
@@ -433,7 +406,6 @@ async function sendSettlementEmailsToAll({
   const emailResults = [];
 
   try {
-    // সব DFSP info DB থেকে নাও (email সহ)
     const [dfsps] = await pool.execute(
       `SELECT dfsp_id, name, currency, email FROM dfsps WHERE email IS NOT NULL AND email != ''`,
     );
@@ -447,7 +419,6 @@ async function sendSettlementEmailsToAll({
 
     for (const dfsp of dfsps) {
       try {
-        // এই DFSP এর transfer stats নাও
         const [[stats]] = await pool.execute(
           `
           SELECT
@@ -462,7 +433,6 @@ async function sendSettlementEmailsToAll({
           [dfsp.dfsp_id, dfsp.dfsp_id, dfsp.dfsp_id, dfsp.dfsp_id],
         );
 
-        // Position নাও
         const [[pos]] = await pool.execute(
           `
           SELECT current_position, net_debit_cap
@@ -500,9 +470,7 @@ async function sendSettlementEmailsToAll({
           email: dfsp.email,
           status: 'sent',
         });
-        console.log(
-          `[SETTLEMENT EMAIL] Sent to ${dfsp.dfsp_id} <${dfsp.email}>`,
-        );
+
       } catch (e) {
         emailResults.push({
           dfsp_id: dfsp.dfsp_id,
@@ -510,13 +478,11 @@ async function sendSettlementEmailsToAll({
           status: 'failed',
           error: e.message,
         });
-        console.error(
-          `[SETTLEMENT EMAIL] Failed for ${dfsp.dfsp_id}: ${e.message}`,
-        );
+       // skip.
       }
     }
   } catch (e) {
-    console.error(`[SETTLEMENT EMAIL] Fatal: ${e.message}`);
+    // skip
   }
 
   return emailResults;

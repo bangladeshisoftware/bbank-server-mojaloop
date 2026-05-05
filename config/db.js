@@ -1,4 +1,3 @@
-// src/utils/db.js
 const mysql = require('mysql2/promise');
 
 const pool = mysql.createPool({
@@ -11,7 +10,6 @@ const pool = mysql.createPool({
   queueLimit: 0
 });
 
-// Optional: test connection on startup
 (async () => {
   try {
     const connection = await pool.getConnection();

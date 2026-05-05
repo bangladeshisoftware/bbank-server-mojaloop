@@ -1,20 +1,9 @@
-// ================================================================
-//  DASHBOARD CONTROLLER
-//  File : src/controllers/dashboard.controller.js
-//
-//  GET /api/dashboard/summary
-//
-//  Uses: transactions table (direction: OUTGOING|INCOMING)
-//        merchants table
-//        users table
-// ================================================================
-
 const { pool } = require('../config/db');
 
 exports.getSummary = async (req, res) => {
   try {
 
-    // ── 1. TODAY ─────────────────────────────────────────────
+    //  1. TODAY
     const [[today]] = await pool.execute(`
       SELECT
         COUNT(*)                                                        AS total,
@@ -48,7 +37,7 @@ exports.getSummary = async (req, res) => {
       WHERE DATE(created_at) = CURDATE()
     `);
 
-    // ── 2. YESTERDAY ─────────────────────────────────────────
+    // 2. YESTERDAY 
     const [[yesterday]] = await pool.execute(`
       SELECT
         COUNT(*)                                                        AS total,
@@ -63,7 +52,7 @@ exports.getSummary = async (req, res) => {
       WHERE DATE(created_at) = CURDATE() - INTERVAL 1 DAY
     `);
 
-    // ── 3. THIS MONTH ─────────────────────────────────────────
+    // 3. THIS MONTH
     const [[this_month]] = await pool.execute(`
       SELECT
         COUNT(*)                                                        AS total,
@@ -80,7 +69,7 @@ exports.getSummary = async (req, res) => {
         AND YEAR(created_at)  = YEAR(CURDATE())
     `);
 
-    // ── 4. LAST 7 DAYS (for trend) ────────────────────────────
+    // 4. LAST 7 DAYS (for trend)
     const [last7days] = await pool.execute(`
       SELECT
         DATE(created_at)                                                AS date,
@@ -98,7 +87,7 @@ exports.getSummary = async (req, res) => {
       ORDER BY date ASC
     `);
 
-    // ── 5. HOURLY (last 24h) ──────────────────────────────────
+    // 5. HOURLY (last 24h)
     const [hourly] = await pool.execute(`
       SELECT
         HOUR(created_at)                                                AS hour,
@@ -114,7 +103,7 @@ exports.getSummary = async (req, res) => {
       ORDER BY hour ASC
     `);
 
-    // ── 6. TYPE BREAKDOWN (today) ─────────────────────────────
+    // 6. TYPE BREAKDOWN (today)
     const [type_breakdown] = await pool.execute(`
       SELECT
         type,
@@ -130,7 +119,7 @@ exports.getSummary = async (req, res) => {
       ORDER BY total DESC
     `);
 
-    // ── 7. STATUS DISTRIBUTION (today) ───────────────────────
+    // 7. STATUS DISTRIBUTION (today)
     const [status_dist] = await pool.execute(`
       SELECT
         status,
@@ -142,7 +131,7 @@ exports.getSummary = async (req, res) => {
       ORDER BY count DESC
     `);
 
-    // ── 8. RECENT TRANSACTIONS (last 10) ─────────────────────
+    // 8. RECENT TRANSACTIONS (last 10)
     const [recent] = await pool.execute(`
       SELECT
         t.id, t.transfer_id, t.quote_id,
@@ -157,7 +146,7 @@ exports.getSummary = async (req, res) => {
       LIMIT 10
     `);
 
-    // ── 9. MERCHANTS ──────────────────────────────────────────
+    // 9. MERCHANTS
     const [[merchants]] = await pool.execute(`
       SELECT
         COUNT(*)                              AS total,
@@ -167,7 +156,7 @@ exports.getSummary = async (req, res) => {
       FROM merchant
     `);
 
-    // ── 10. USERS ─────────────────────────────────────────────
+    // 10. USERS
     const [[users_summary]] = await pool.execute(`
       SELECT
         COUNT(*)                              AS total,
@@ -177,7 +166,7 @@ exports.getSummary = async (req, res) => {
       FROM users
     `);
 
-    // ── 11. TOP MERCHANTS by volume (this month) ──────────────
+    // 11. TOP MERCHANTS by volume (this month)
     const [top_merchants] = await pool.execute(`
       SELECT
         t.merchant_id,
@@ -197,7 +186,7 @@ exports.getSummary = async (req, res) => {
       LIMIT 5
     `);
 
-    // ── 12. TODAY vs YESTERDAY comparison ────────────────────
+    // 12. TODAY vs YESTERDAY comparison
     const todayVol     = parseFloat(today.committed_volume || 0);
     const yestVol      = parseFloat(yesterday.committed_volume || 0);
     const vol_change   = yestVol > 0 ? ((todayVol - yestVol) / yestVol * 100).toFixed(1) : null;
@@ -206,7 +195,7 @@ exports.getSummary = async (req, res) => {
     const yestCount    = parseInt(yesterday.committed || 0);
     const count_change = yestCount > 0 ? ((todayCount - yestCount) / yestCount * 100).toFixed(1) : null;
 
-    // ── Response ──────────────────────────────────────────────
+    // Response
     return res.json({
       today: {
         ...today,

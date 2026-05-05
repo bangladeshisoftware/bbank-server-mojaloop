@@ -1,17 +1,6 @@
-// ================================================================
-//  AUTH MIDDLEWARE
-//  File : src/middleware/auth.middleware.js
-//
-//  Usage in routes:
-//    auth               — any authenticated user
-//    auth.admin         — ADMIN role only
-//    auth.merchant      — MERCHANT role only
-//    auth.roles('ADMIN','MERCHANT')  — multiple roles
-// ================================================================
-
 const jwt = require('jsonwebtoken');
 
-// ── Core token verifier ───────────────────────────────────────
+// Core token verifier
 function verifyToken(req, res, next) {
   const header = req.headers.authorization;
 
@@ -22,7 +11,6 @@ function verifyToken(req, res, next) {
 
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    // decoded: { id, username, email, role, merchant_id }
     req.user = decoded;
     next();
   } catch (err) {
@@ -32,7 +20,7 @@ function verifyToken(req, res, next) {
   }
 }
 
-// ── Role guard factory ────────────────────────────────────────
+// Role guard factory
 function requireRoles(...roles) {
   return (req, res, next) => {
     if (!req.user)
@@ -47,9 +35,9 @@ function requireRoles(...roles) {
   };
 }
 
-// ── Attach named guards as properties ────────────────────────
+// Attach named guards as properties
 verifyToken.admin   = requireRoles('ADMIN');
 verifyToken.merchant = requireRoles('MERCHANT');
-verifyToken.roles   = requireRoles;        // flexible: auth.roles('ADMIN','MERCHANT')
+verifyToken.roles   = requireRoles;
 
 module.exports = verifyToken;

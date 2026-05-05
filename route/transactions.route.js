@@ -9,7 +9,6 @@ const {
   getMerchantDashboard,
 } = require('../controller/transactions.controller');
 
-// IMPORTANT: summary route MUST come before /:id
 router.get('/transactions/summary', auth, getTransactionSummary);
 router.get('/transactions', auth, getTransactions);
 router.get('/transactions/:id', auth, getTransactionById);

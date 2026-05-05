@@ -8,7 +8,7 @@ const { logActivity } = require('./activity.controller');
 const OTP_EXPIRY_MINUTES = 10;
 const SALT_ROUNDS = 12;
 
-// ── helpers ──────────────────────────────────────────────────
+//  helpers
 function maskEmail(email) {
   if (!email) return null;
   const [local, domain] = email.split('@');
@@ -61,7 +61,7 @@ exports.login = async (req, res) => {
 
     const user = rows[0];
 
-    // Generic error — don't reveal whether user exists
+    // Generic error  don't reveal whether user exists
     if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
     if (!user.is_active)
@@ -81,10 +81,6 @@ exports.login = async (req, res) => {
       [otp, otpExpiry, user.id],
     );
 
-    // Dev mode — print OTP to console
-    if (process.env.NODE_ENV !== 'production') {
-      console.log(`🔑 [DEV] OTP for ${user.username}: ${otp}`);
-    }
     // send email.
     let emailSent = false;
     if (user.email) {
@@ -95,23 +91,14 @@ exports.login = async (req, res) => {
           otp,
         });
         emailSent = true;
-        console.log(`[AUTH] OTP sent to ${user.email}`);
       } catch (emailErr) {
         return res.status(400).json({ message: emailErr });
-        console.error(`[AUTH] Email failed: ${emailErr.message}`);
-        if (process.env.NODE_ENV !== 'production') {
-          console.log(`🔑 [DEV] OTP for ${user.username}: ${otp}`);
-        }
       }
     } else {
-      console.warn(`⚠️ [AUTH] No email for user ${user.username}`);
-      if (process.env.NODE_ENV !== 'production') {
-        console.log(`🔑 [DEV] OTP for ${user.username}: ${otp}`);
-      }
+      null;
     }
-    // send email.
-    // TODO (production): send OTP via email / SMS using your mail service
 
+    // send email.
     return res.json({
       emailSent,
       otp_required: true,
@@ -120,7 +107,6 @@ exports.login = async (req, res) => {
       expires_in: `${OTP_EXPIRY_MINUTES} minutes`,
     });
   } catch (err) {
-    console.error('[AUTH] login error:', err);
     return res.status(500).json({ error: err });
   }
 };
@@ -226,7 +212,6 @@ exports.refresh = async (req, res) => {
         .json({ error: 'Invalid or expired refresh token' });
     }
 
-    // Re-fetch user to ensure still active
     const [rows] = await pool.execute(
       `SELECT id, username, email, role, merchant_id, is_active FROM users WHERE id = ? LIMIT 1`,
       [decoded.id],
@@ -252,14 +237,13 @@ exports.refresh = async (req, res) => {
 };
 
 exports.logout = async (req, res) => {
-  // Optional: log the logout event to activity_logs
   try {
     if (req.user?.id) {
       await pool
         .execute(`UPDATE users SET updated_at = NOW() WHERE id = ?`, [
           req.user.id,
         ])
-        .catch(() => {}); // non-fatal
+        .catch(() => {});
     }
   } catch {}
   return res.json({ message: 'Logged out successfully' });
@@ -316,7 +300,6 @@ exports.changePassword = async (req, res) => {
         .status(400)
         .json({ error: 'Current password and new password are required' });
 
-    // Fetch current hash
     const [rows] = await pool.execute(
       `SELECT id, password FROM users WHERE id = ? LIMIT 1`,
       [req.user.id],
@@ -344,7 +327,6 @@ exports.changePassword = async (req, res) => {
 
 exports.getUsers = async (req, res) => {
   try {
-    // ADMIN only
     if (req.user.role !== 'ADMIN') {
       return res.status(403).json({ error: 'Access denied. ADMIN only.' });
     }
@@ -363,7 +345,6 @@ exports.getUsers = async (req, res) => {
     const currentPage = Math.max(isNaN(parsedPage) ? 1 : parsedPage, 1);
     const offset = (currentPage - 1) * limit;
 
-    // Dynamic filters
     const conditions = [];
     const params = [];
 
@@ -390,9 +371,6 @@ exports.getUsers = async (req, res) => {
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // -----------------------
-    // COUNT QUERY
-    // -----------------------
     const [countRows] = await pool.execute(
       `SELECT COUNT(*) AS total
        FROM users u
@@ -402,11 +380,6 @@ exports.getUsers = async (req, res) => {
 
     const total = countRows[0]?.total || 0;
 
-    // -----------------------
-    // DATA QUERY
-    // IMPORTANT FIX:
-    // LIMIT/OFFSET inlined
-    // -----------------------
     const [rows] = await pool.execute(
       `SELECT u.id,
               u.username,
@@ -524,7 +497,6 @@ exports.updateUser = async (req, res) => {
     const { id } = req.params;
     const { full_name, phone, role, is_active, merchant_id } = req.body;
 
-    // Cannot deactivate yourself
     if (id === req.user.id && is_active === 0)
       return res
         .status(400)
