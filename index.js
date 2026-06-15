@@ -47,7 +47,9 @@ app.use(
       'application/*+json',
       'application/vnd.interoperability.parties+json;version=2.0',
       'application/vnd.interoperability.transfers+json;version=2.0',
+      'application/vnd.interoperability.transfers+json;version=1.0',
       'application/vnd.interoperability.quotes+json;version=2.0',
+      'application/vnd.interoperability.quotes+json;version=1.1',
     ],
   }),
 );
@@ -75,16 +77,54 @@ function queryDB(sql, params = []) {
   });
 }
 
-// Helper function.
+/////////////// UTILS FUNCTION ////////////////
+
+async function generateDynamicILPData(ilpData) {
+  const expirationTime = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const ilpPacket = Buffer.from(JSON.stringify(ilpData)).toString('base64');
+
+  // fulfilment = random preimage
+  const fulfilment = crypto.randomBytes(32).toString('base64url');
+
+  // condition = SHA256(fulfilment) — Mojaloop validates this!
+  const condition = crypto
+    .createHash('sha256')
+    .update(Buffer.from(fulfilment, 'base64url'))
+    .digest('base64url');
+
+  return { ilpPacket, condition, fulfilment, expiration: expirationTime };
+}
+
+function validateILPPacket(ilpPacket, condition) {
+  try {
+    if (!ilpPacket || !condition) return false;
+
+    const decoded = Buffer.from(ilpPacket, 'base64').toString();
+    const packet = JSON.parse(decoded);
+
+    return packet && packet.amount;
+  } catch (error) {
+    return false;
+  }
+}
+
+function generateFulfilment(condition) {
+  return crypto.randomBytes(32).toString('base64url');
+}
+
 async function sendCallbackToHub(callbackPath, responseBody, originalHeaders) {
   try {
     const hubCallbackUrl = callbackPath;
+
+    // Extract path to detect service type
     const path = hubCallbackUrl.toLowerCase();
 
+    // Dynamic values from received callback headers
     const fspiopSource = originalHeaders['fspiop-source'] || 'switch';
     const fspiopDestination =
       originalHeaders['fspiop-destination'] || process.env.fspId;
 
+    // Generate dynamic date & trace ID
     const dynamicDate = new Date().toUTCString();
     const traceId = crypto.randomUUID();
 
@@ -144,7 +184,7 @@ async function sendCallbackToHub(callbackPath, responseBody, originalHeaders) {
     const response = await fetch(hubCallbackUrl, options);
 
     if (response.status >= 200 && response.status < 300) {
-      console.log('âœ… Callback sent successfully to hub');
+      console.log('Callback sent successfully to hub');
     } else {
       console.error(
         'Failed to send callback to hub:',
@@ -188,6 +228,525 @@ async function forwardRequestCore(res, url, options) {
   }
 }
 
+async function send_S1_createQuote({
+  quote_id,
+  transaction_id,
+  payer_fsp,
+  payee_fsp,
+  payer_id_type,
+  payer_id_value,
+  payer_name,
+  payee_id_type,
+  payee_id_value,
+  merchant_id,
+  amount,
+  currency,
+  type = 'P2P',
+}) {
+  await queryDB(
+    `INSERT INTO transactions (
+       id, quote_id, transaction_id,
+       type, direction,
+       payer_fsp, payee_fsp,
+       payer_id_type, payer_id_value, payer_name,
+       payee_id_type, payee_id_value,
+       merchant_id,
+       amount, currency,
+       status, quote_at
+     ) VALUES (
+       UUID(), ?, ?,
+       ?, 'OUTGOING',
+       ?, ?,
+       ?, ?, ?,
+       ?, ?,
+       ?,
+       ?, ?,
+       'QUOTE_REQUESTED', NOW()
+     )`,
+    [
+      quote_id,
+      transaction_id,
+      type,
+      payer_fsp || null,
+      payee_fsp || null,
+      payer_id_type || null,
+      payer_id_value || null,
+      payer_name || null,
+      payee_id_type || null,
+      payee_id_value || null,
+      merchant_id || null,
+      amount,
+      currency || process.env.currency || 'BDT',
+    ],
+  );
+  console.log(
+    `[SEND S1] OUTGOING created  quote_id=${quote_id}  status=QUOTE_REQUESTED`,
+  );
+}
+
+async function send_S2_quoteReceived({
+  quote_id,
+  receive_amount,
+  fee,
+  ilp_packet,
+  condition_hash,
+  expiration,
+}) {
+  await queryDB(
+    `UPDATE transactions SET
+       status         = 'QUOTE_RECEIVED',
+       receive_amount = ?,
+       fee            = ?,
+       ilp_packet     = ?,
+       condition_hash = ?,
+       expiration     = ?,
+       updated_at     = NOW()
+     WHERE quote_id = ? AND direction = 'OUTGOING'`,
+    [
+      receive_amount || null,
+      fee || 0,
+      ilp_packet || null,
+      condition_hash || null,
+      expiration ? new Date(expiration) : null,
+      quote_id,
+    ],
+  );
+}
+
+async function send_S3_transferSent({ quote_id, transfer_id }) {
+  await queryDB(
+    `UPDATE transactions SET
+       transfer_id = ?,
+       status      = 'TRANSFER_SENT',
+       transfer_at = NOW(),
+       updated_at  = NOW()
+     WHERE quote_id = ? AND direction = 'OUTGOING'`,
+    [transfer_id, quote_id],
+  );
+}
+
+async function send_S4_finalStatus(transfer_id, newStatus, extra = {}) {
+  const TERMINAL = ['COMMITTED', 'FAILED', 'ABORTED', 'EXPIRED'];
+  try {
+    const rows = await queryDB(
+      `SELECT id, status FROM transactions
+       WHERE transfer_id = ? AND direction = 'OUTGOING' LIMIT 1`,
+      [transfer_id],
+    );
+
+    if (!rows || rows.length === 0) {
+      return;
+    }
+
+    const row = rows[0];
+
+    if (row.status === newStatus) {
+      return;
+    }
+    if (TERMINAL.includes(row.status)) {
+      return;
+    }
+
+    // Build dynamic SET fields
+    const fields = ['status = ?', 'updated_at = NOW()'];
+    const values = [newStatus];
+
+    if (newStatus === 'COMMITTED') {
+      fields.push('completed_at = NOW()');
+      if (extra.fulfilment) {
+        fields.push('fulfilment = ?');
+        values.push(extra.fulfilment);
+      }
+    }
+    if (['FAILED', 'ABORTED', 'EXPIRED'].includes(newStatus)) {
+      if (extra.error_code) {
+        fields.push('error_code = ?');
+        values.push(extra.error_code);
+      }
+      if (extra.error_description) {
+        fields.push('error_description = ?');
+        values.push(extra.error_description);
+      }
+    }
+
+    values.push(row.id); // WHERE id = ?
+    await queryDB(
+      `UPDATE transactions SET ${fields.join(', ')} WHERE id = ?`,
+      values,
+    );
+
+    // Balance Debit
+    if (newStatus === 'COMMITTED') {
+      const txnRows = await queryDB(
+        `SELECT merchant_id, amount, fee, currency, transaction_id, type, payee_id_value
+         FROM transactions WHERE id = ? LIMIT 1`,
+        [row.id],
+      );
+      const txn = txnRows?.[0];
+      if (txn?.merchant_id) {
+        await updateBalance({
+          merchant_id: txn.merchant_id,
+          transaction_id: txn.transaction_id,
+          transfer_id,
+          type: 'DEBIT',
+          amount: parseFloat(txn.amount || 0),
+          fee: parseFloat(txn.fee || 0),
+          currency: txn.currency || 'BDT',
+          note: `${txn.type || 'P2P'} sent to ${txn.payee_id_value}`,
+        }).catch((e) => console.error('[BALANCE DEBIT]', e.message));
+      }
+    }
+  } catch (err) {
+    console.error('[SEND S4] error:', err.message);
+  }
+}
+
+async function recv_R1_createQuote(body, reqHeaders) {
+  const exists = await queryDB(
+    `SELECT id FROM transactions
+     WHERE quote_id = ? AND direction = 'INCOMING' LIMIT 1`,
+    [body?.quoteId],
+  );
+  if (exists && exists.length > 0) {
+    console.log(`[RECV R1] duplicate — skip  quote_id=${body?.quoteId}`);
+    return;
+  }
+
+  const SCENARIO_MAP = {
+    TRANSFER: 'P2P',
+    PAYMENT: 'INSTANT',
+    DEPOSIT: 'INSTANT',
+    WITHDRAWAL: 'P2P',
+    REFUND: 'P2P',
+  };
+  const scenario = body?.transactionType?.scenario || 'TRANSFER';
+  const txnType = SCENARIO_MAP[scenario] || 'P2P';
+
+  const payerName =
+    [
+      body?.payer?.personalInfo?.complexName?.firstName,
+      body?.payer?.personalInfo?.complexName?.lastName,
+    ]
+      .filter(Boolean)
+      .join(' ') || null;
+
+  await queryDB(
+    `INSERT INTO transactions (
+       id, quote_id, transaction_id,
+       type, direction,
+       payer_fsp, payee_fsp,
+       payer_id_type, payer_id_value, payer_name,
+       payee_id_type, payee_id_value,
+       amount, currency,
+       status, quote_at
+     ) VALUES (
+       UUID(), ?, ?,
+       ?, 'INCOMING',
+       ?, ?,
+       ?, ?, ?,
+       ?, ?,
+       ?, ?,
+       'QUOTE_REQUESTED', NOW()
+     )`,
+    [
+      body?.quoteId || null,
+      body?.transactionId || null,
+      txnType,
+      body?.payer?.partyIdInfo?.fspId || reqHeaders['fspiop-source'] || null,
+      body?.payee?.partyIdInfo?.fspId ||
+        reqHeaders['fspiop-destination'] ||
+        process.env.fspId ||
+        null,
+      body?.payer?.partyIdInfo?.partyIdType || null,
+      body?.payer?.partyIdInfo?.partyIdentifier || null,
+      payerName,
+      body?.payee?.partyIdInfo?.partyIdType || null,
+      body?.payee?.partyIdInfo?.partyIdentifier || null,
+      body?.amount?.amount || 0,
+      body?.amount?.currency || process.env.currency || 'BDT',
+    ],
+  );
+
+  console.log(
+    `[RECV R1] INCOMING created  quote_id=${body?.quoteId}  type=${txnType}  status=QUOTE_REQUESTED`,
+  );
+}
+async function recv_R2_ilpSentToHub({
+  quote_id,
+  ilp_packet,
+  condition_hash,
+  expiration,
+  receive_amount,
+  fee,
+}) {
+  await queryDB(
+    `UPDATE transactions SET
+       status         = 'QUOTE_RECEIVED',
+       receive_amount = ?,
+       fee            = ?,
+       ilp_packet     = ?,
+       condition_hash = ?,
+       expiration     = ?,
+       updated_at     = NOW()
+     WHERE quote_id = ? AND direction = 'INCOMING'`,
+    [
+      receive_amount || null,
+      fee || 0,
+      ilp_packet || null,
+      condition_hash || null,
+      expiration ? new Date(expiration) : null,
+      quote_id,
+    ],
+  );
+}
+
+async function recv_R3_transferReceived(body, reqHeaders) {
+  const transferId = body?.transferId;
+  if (!transferId) return;
+
+  const byQuote = body?.quoteId
+    ? await queryDB(
+        `SELECT id FROM transactions
+         WHERE quote_id = ? AND direction = 'INCOMING' LIMIT 1`,
+        [body.quoteId],
+      )
+    : [];
+
+  if (byQuote && byQuote.length > 0) {
+    await queryDB(
+      `UPDATE transactions SET
+         transfer_id = ?,
+         status      = 'TRANSFER_SENT',
+         transfer_at = NOW(),
+         updated_at  = NOW()
+       WHERE quote_id = ? AND direction = 'INCOMING'`,
+      [transferId, body.quoteId],
+    );
+    console.log(
+      `[RECV R3] transfer linked  quote_id=${body.quoteId}  transfer_id=${transferId}  status=TRANSFER_SENT`,
+    );
+  } else {
+    const already = await queryDB(
+      `SELECT id FROM transactions
+       WHERE transfer_id = ? AND direction = 'INCOMING' LIMIT 1`,
+      [transferId],
+    );
+    if (already && already.length > 0) return;
+
+    await queryDB(
+      `INSERT INTO transactions (
+         id, transfer_id, quote_id, transaction_id,
+         type, direction,
+         payer_fsp, payee_fsp,
+         amount, currency,
+         ilp_packet, condition_hash, expiration,
+         status, transfer_at
+       ) VALUES (
+         UUID(), ?, ?, ?,
+         'P2P', 'INCOMING',
+         ?, ?,
+         ?, ?,
+         ?, ?, ?,
+         'TRANSFER_SENT', NOW()
+       )`,
+      [
+        transferId,
+        body?.quoteId || null,
+        body?.transactionId || null,
+        body?.payerFsp || reqHeaders['fspiop-source'] || null,
+        body?.payeeFsp || reqHeaders['fspiop-destination'] || null,
+        body?.amount?.amount || 0,
+        body?.amount?.currency || process.env.currency || 'BDT',
+        body?.ilpPacket || null,
+        body?.condition || null,
+        body?.expiration ? new Date(body.expiration) : null,
+      ],
+    );
+    console.log(
+      `[RECV R3] INCOMING created from transfer (no prior quote)  transfer_id=${transferId}`,
+    );
+  }
+}
+
+async function recv_R4_finalStatus(transfer_id, newStatus, extra = {}) {
+  const TERMINAL = ['COMMITTED', 'FAILED', 'ABORTED', 'EXPIRED'];
+  try {
+    const rows = await queryDB(
+      `SELECT id, status FROM transactions
+       WHERE transfer_id = ? AND direction = 'INCOMING' LIMIT 1`,
+      [transfer_id],
+    );
+
+    if (!rows || rows.length === 0) {
+      console.warn(
+        `[RECV R4] no INCOMING row found for transfer_id=${transfer_id}`,
+      );
+      return;
+    }
+
+    const row = rows[0];
+
+    if (row.status === newStatus) {
+      console.log(`[RECV R4] already ${newStatus} — skip`);
+      return;
+    }
+    if (TERMINAL.includes(row.status)) {
+      console.log(`[RECV R4] already terminal (${row.status}) — skip`);
+      return;
+    }
+
+    const fields = ['status = ?', 'updated_at = NOW()'];
+    const values = [newStatus];
+
+    if (newStatus === 'COMMITTED') {
+      fields.push('completed_at = NOW()');
+      if (extra.fulfilment) {
+        fields.push('fulfilment = ?');
+        values.push(extra.fulfilment);
+      }
+    }
+    if (['FAILED', 'ABORTED', 'EXPIRED'].includes(newStatus)) {
+      if (extra.error_code) {
+        fields.push('error_code = ?');
+        values.push(extra.error_code);
+      }
+      if (extra.error_description) {
+        fields.push('error_description = ?');
+        values.push(extra.error_description);
+      }
+    }
+
+    values.push(row.id);
+    await queryDB(
+      `UPDATE transactions SET ${fields.join(', ')} WHERE id = ?`,
+      values,
+    );
+
+    // Balance credit.
+    if (newStatus === 'COMMITTED') {
+      const txnRows = await queryDB(
+        `SELECT merchant_id, amount, fee, currency, transaction_id, type, payer_id_value
+         FROM transactions WHERE id = ? LIMIT 1`,
+        [row.id],
+      );
+      const txn = txnRows?.[0];
+      if (txn?.merchant_id) {
+        await updateBalance({
+          merchant_id: txn.merchant_id,
+          transaction_id: txn.transaction_id,
+          transfer_id,
+          type: 'CREDIT',
+          amount: parseFloat(txn.amount || 0),
+          fee: 0,
+          currency: txn.currency || 'BDT',
+          note: `${txn.type || 'P2P'} received from ${txn.payer_id_value}`,
+        }).catch((e) => console.error('[BALANCE CREDIT]', e.message));
+      }
+    }
+  } catch (err) {
+    console.error('[RECV R4] error:', err.message);
+  }
+}
+
+async function processTransferRequest(transferData, headers) {
+  try {
+    const responseBody = {
+      completedTimestamp: new Date().toISOString(),
+      transferState: 'COMMITTED',
+    };
+    await sendCallbackToHub(
+      `${process.env.ML_API_ADAPTER}/transfers/${transferData.transferId}`,
+      responseBody,
+      headers,
+    );
+  } catch (error) {
+    console.error('Error processing transfer:', error);
+    const errorResponse = {
+      errorInformation: {
+        errorCode: '5000',
+        errorDescription: 'Internal server error processing transfer',
+      },
+    };
+    await sendCallbackToHub(
+      `${process.env.ML_API_ADAPTER}/transfers/${transferData.transferId}/error`,
+      errorResponse,
+      headers,
+    );
+  }
+}
+
+async function processPartyLookup(partyIdType, partyIdentifier, headers) {
+  try {
+    const sql = `SELECT * FROM merchant WHERE id_type = ? AND id_value = ? AND status = ?`;
+    const merchant = await queryDB(sql, [partyIdType, partyIdentifier, '1']);
+
+    let responseBody;
+    let callbackUrl;
+
+    if (merchant?.length > 0) {
+      if (merchant[0]?.status === '1') {
+        // active merchant found
+        responseBody = {
+          party: {
+            partyIdInfo: {
+              partyIdType,
+              partyIdentifier,
+              fspId: process.env.fspId,
+            },
+            name: merchant[0].display_name || 'Unknown Merchant',
+            personalInfo: {
+              complexName: {
+                firstName: merchant[0].first_name || 'N/A',
+                lastName: merchant[0].last_name || 'N/A',
+              },
+              dateOfBirth: merchant[0].dob || null,
+            },
+          },
+        };
+
+        callbackUrl = `${process.env.ALS_SERVICE}/parties/${partyIdType}/${partyIdentifier}`;
+      } else {
+        // merchant inactive
+        responseBody = {
+          errorInformation: {
+            errorCode: '3200',
+            errorDescription: 'Merchant is inactive',
+          },
+        };
+
+        callbackUrl = `${process.env.ALS_SERVICE}/parties/${partyIdType}/${partyIdentifier}/error`;
+      }
+    } else {
+      // Merchant not found
+      responseBody = {
+        errorInformation: {
+          errorCode: '3300',
+          errorDescription: 'Merchant not found',
+        },
+      };
+
+      callbackUrl = `${process.env.ALS_SERVICE}/parties/${partyIdType}/${partyIdentifier}/error`;
+    }
+
+    await sendCallbackToHub(callbackUrl, responseBody, headers);
+  } catch (error) {
+    console.error('Error processing party lookup:', error);
+    const errorResponse = {
+      errorInformation: {
+        errorCode: '5000',
+        errorDescription: 'Internal server error processing party lookup',
+      },
+    };
+    await sendCallbackToHub(
+      `${process.env.ALS_SERVICE}/parties/${partyIdType}/${partyIdentifier}/error`,
+      errorResponse,
+      headers,
+    );
+  }
+}
+
+//////////////////// CORE API //////////////////////
+
 app.get('/api/parties', auth, async (req, res) => {
   try {
     const {
@@ -200,11 +759,9 @@ app.get('/api/parties', auth, async (req, res) => {
       per_page = 10,
     } = req.query;
 
-    // Pagination
     const limit = Math.min(Math.max(parseInt(per_page) || 10, 1), 100);
     const offset = (Math.max(parseInt(page) || 1, 1) - 1) * limit;
 
-    // Build WHERE
     const conditions = [];
     const params = [];
 
@@ -243,7 +800,6 @@ app.get('/api/parties', auth, async (req, res) => {
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    // Count
     const countResult = await queryDB(
       `SELECT COUNT(*) AS total FROM merchant ${where}`,
       params,
@@ -251,7 +807,6 @@ app.get('/api/parties', auth, async (req, res) => {
     const total = countResult[0]?.total || 0;
     const total_pages = Math.ceil(total / limit);
 
-    // Data
     const data = await queryDB(
       `SELECT
          id, display_name, first_name, middle_name, last_name,
@@ -498,6 +1053,7 @@ app.post('/api/parties/add', auth, async (req, res) => {
 
       const merchant_id = merchantResult.insertId;
 
+      // Hash password
       const hashedPassword = await bcrypt.hash(password, 10);
 
       // Extract username from email
@@ -533,7 +1089,7 @@ app.post('/api/parties/add', auth, async (req, res) => {
       try {
         await sendEmail({
           to: email,
-          subject: `B Bank Portal Access by — ${username}`,
+          subject: `A Bank Portal Access by — ${username}`,
           html: `
 <!DOCTYPE html>
 <html>
@@ -634,7 +1190,7 @@ app.post('/api/parties/add', auth, async (req, res) => {
       <div class="content">
         <div class="intro">
           Dear <strong>${display_name || 'Merchant'}</strong>,<br><br>
-          Your Financial Portal account has been successfully created by B Bank.
+          Your Financial Portal account has been successfully created by A Bank.
         </div>
 
         <div class="info-row">
@@ -766,7 +1322,6 @@ app.delete('/api/parties/:id', auth, async (req, res) => {
   try {
     const { id } = req.params;
 
-    // 1. Find merchant
     const merchant = await queryDB('SELECT * FROM merchant WHERE id = ?', [id]);
 
     if (merchant.length === 0) {
@@ -775,7 +1330,6 @@ app.delete('/api/parties/:id', auth, async (req, res) => {
 
     const { id_type, id_value, display_name } = merchant[0];
 
-    // 2. De-register from ALS
     let alsStatus = 'skipped';
     try {
       const alsUrl = `${process.env.ALS_SERVICE}/participants/${id_type}/${id_value}`;
@@ -794,12 +1348,16 @@ app.delete('/api/parties/:id', auth, async (req, res) => {
 
       alsStatus =
         status >= 200 && status < 300 ? 'success' : `failed (HTTP ${status})`;
+
+      if (status >= 200 && status < 300) {
+        // console.log(`[ALS] De-registered ${id_type}/${id_value}`);
+      } else {
+        // Non-fatal — log and continue with DB cleanup
+      }
     } catch (alsErr) {
-      // Network error hitting ALS
       alsStatus = `error: ${alsErr.message}`;
     }
 
-    // 3. Delete linked users
     const users = await queryDB('SELECT id FROM users WHERE merchant_id = ?', [
       id,
     ]);
@@ -809,11 +1367,9 @@ app.delete('/api/parties/:id', auth, async (req, res) => {
       console.log(`[DB] Deleted ${users.length} user(s) for merchant ${id}`);
     }
 
-    // 4. Delete merchant
     await queryDB('DELETE FROM merchant WHERE id = ?', [id]);
     console.log(`[DB] Deleted merchant ${id} (${display_name})`);
 
-    // 5. Response
     return res.status(200).json({
       message: `Merchant "${display_name}" deleted successfully${users.length > 0 ? ` along with ${users.length} associated user(s)` : ''}`,
       als_status: alsStatus,
@@ -837,417 +1393,32 @@ app.put('/api/merchant/update/status/:id', auth, async (req, res) => {
   }
 });
 
-async function send_S1_createQuote({
-  quote_id,
-  transaction_id,
-  payer_fsp,
-  payee_fsp,
-  payer_id_type,
-  payer_id_value,
-  payer_name,
-  payee_id_type,
-  payee_id_value,
-  merchant_id,
-  amount,
-  currency,
-  type = 'P2P',
-}) {
-  await queryDB(
-    `INSERT INTO transactions (
-       id, quote_id, transaction_id,
-       type, direction,
-       payer_fsp, payee_fsp,
-       payer_id_type, payer_id_value, payer_name,
-       payee_id_type, payee_id_value,
-       merchant_id,
-       amount, currency,
-       status, quote_at
-     ) VALUES (
-       UUID(), ?, ?,
-       ?, 'OUTGOING',
-       ?, ?,
-       ?, ?, ?,
-       ?, ?,
-       ?,
-       ?, ?,
-       'QUOTE_REQUESTED', NOW()
-     )`,
-    [
-      quote_id,
-      transaction_id,
-      type,
-      payer_fsp || null,
-      payee_fsp || null,
-      payer_id_type || null,
-      payer_id_value || null,
-      payer_name || null,
-      payee_id_type || null,
-      payee_id_value || null,
-      merchant_id || null,
-      amount,
-      currency || process.env.currency || 'BDT',
-    ],
-  );
-}
+//////////////////////// INIT PROCESS ///////////////////////////
 
-async function send_S2_quoteReceived({
-  quote_id,
-  receive_amount,
-  fee,
-  ilp_packet,
-  condition_hash,
-  expiration,
-}) {
-  await queryDB(
-    `UPDATE transactions SET
-       status         = 'QUOTE_RECEIVED',
-       receive_amount = ?,
-       fee            = ?,
-       ilp_packet     = ?,
-       condition_hash = ?,
-       expiration     = ?,
-       updated_at     = NOW()
-     WHERE quote_id = ? AND direction = 'OUTGOING'`,
-    [
-      receive_amount || null,
-      fee || 0,
-      ilp_packet || null,
-      condition_hash || null,
-      expiration ? new Date(expiration) : null,
-      quote_id,
-    ],
-  );
-}
-
-async function send_S3_transferSent({ quote_id, transfer_id }) {
-  await queryDB(
-    `UPDATE transactions SET
-       transfer_id = ?,
-       status      = 'TRANSFER_SENT',
-       transfer_at = NOW(),
-       updated_at  = NOW()
-     WHERE quote_id = ? AND direction = 'OUTGOING'`,
-    [transfer_id, quote_id],
-  );
-}
-
-async function send_S4_finalStatus(transfer_id, newStatus, extra = {}) {
-  const TERMINAL = ['COMMITTED', 'FAILED', 'ABORTED', 'EXPIRED'];
-  try {
-    const rows = await queryDB(
-      `SELECT id, status FROM transactions
-       WHERE transfer_id = ? AND direction = 'OUTGOING' LIMIT 1`,
-      [transfer_id],
-    );
-
-    if (!rows || rows.length === 0) {
-      return;
-    }
-
-    const row = rows[0];
-
-    if (row.status === newStatus) {
-      console.log(`[SEND S4] already ${newStatus} — skip`);
-      return;
-    }
-    if (TERMINAL.includes(row.status)) {
-      console.log(`[SEND S4] already terminal (${row.status}) — skip`);
-      return;
-    }
-
-    // dynamic fields
-    const fields = ['status = ?', 'updated_at = NOW()'];
-    const values = [newStatus];
-
-    if (newStatus === 'COMMITTED') {
-      fields.push('completed_at = NOW()');
-      if (extra.fulfilment) {
-        fields.push('fulfilment = ?');
-        values.push(extra.fulfilment);
-      }
-    }
-    if (['FAILED', 'ABORTED', 'EXPIRED'].includes(newStatus)) {
-      if (extra.error_code) {
-        fields.push('error_code = ?');
-        values.push(extra.error_code);
-      }
-      if (extra.error_description) {
-        fields.push('error_description = ?');
-        values.push(extra.error_description);
-      }
-    }
-
-    values.push(row.id);
-    await queryDB(
-      `UPDATE transactions SET ${fields.join(', ')} WHERE id = ?`,
-      values,
-    );
-
-    //Balance Debit
-    if (newStatus === 'COMMITTED') {
-      const txnRows = await queryDB(
-        `SELECT merchant_id, amount, fee, currency, transaction_id, type, payee_id_value
-         FROM transactions WHERE id = ? LIMIT 1`,
-        [row.id],
-      );
-      const txn = txnRows?.[0];
-      if (txn?.merchant_id) {
-        await updateBalance({
-          merchant_id: txn.merchant_id,
-          transaction_id: txn.transaction_id,
-          transfer_id,
-          type: 'DEBIT',
-          amount: parseFloat(txn.amount || 0),
-          fee: parseFloat(txn.fee || 0),
-          currency: txn.currency || 'BDT',
-          note: `${txn.type || 'P2P'} sent to ${txn.payee_id_value}`,
-        }).catch((e) => console.error('[BALANCE DEBIT]', e.message));
-      }
-    }
-  } catch (err) {
-    console.error('[SEND S4] error:', err.message);
-  }
-}
-
-async function recv_R1_createQuote(body, reqHeaders) {
-  const exists = await queryDB(
-    `SELECT id FROM transactions
-     WHERE quote_id = ? AND direction = 'INCOMING' LIMIT 1`,
-    [body?.quoteId],
-  );
-  if (exists && exists.length > 0) {
-    console.log(`[RECV R1] duplicate — skip  quote_id=${body?.quoteId}`);
-    return;
-  }
-
-  // Derive type from Hub's transactionType
-  const SCENARIO_MAP = {
-    TRANSFER: 'P2P',
-    PAYMENT: 'INSTANT',
-    DEPOSIT: 'INSTANT',
-    WITHDRAWAL: 'P2P',
-    REFUND: 'P2P',
+// Oracle party id verify to get FSP ID
+app.get('/api/oracle-verify/:id_type/:id_value', async (req, res) => {
+  const { id_type, id_value } = req.params;
+  const url = `${process.env.ALS_SERVICE}/participants/${id_type}/${id_value}`;
+  const options = {
+    method: 'GET',
+    headers: {
+      'Content-Type':
+        'application/vnd.interoperability.participants+json;version=1.1',
+      Accept: 'application/vnd.interoperability.participants+json;version=1.1',
+      'FSPIOP-Source': process.env.fspId,
+      'FSPIOP-Destination': 'account-lookup-service',
+      Authorization: 'Bearer asdfjkl;2e43Asdasa3a34ioaporigniginergk',
+      Date: new Date().toUTCString(),
+    },
   };
-  const scenario = body?.transactionType?.scenario || 'TRANSFER';
-  const txnType = SCENARIO_MAP[scenario] || 'P2P';
+  await forwardRequestCore(res, url, options);
+});
 
-  const payerName =
-    [
-      body?.payer?.personalInfo?.complexName?.firstName,
-      body?.payer?.personalInfo?.complexName?.lastName,
-    ]
-      .filter(Boolean)
-      .join(' ') || null;
-
-  await queryDB(
-    `INSERT INTO transactions (
-       id, quote_id, transaction_id,
-       type, direction,
-       payer_fsp, payee_fsp,
-       payer_id_type, payer_id_value, payer_name,
-       payee_id_type, payee_id_value,
-       amount, currency,
-       status, quote_at
-     ) VALUES (
-       UUID(), ?, ?,
-       ?, 'INCOMING',
-       ?, ?,
-       ?, ?, ?,
-       ?, ?,
-       ?, ?,
-       'QUOTE_REQUESTED', NOW()
-     )`,
-    [
-      body?.quoteId || null,
-      body?.transactionId || null,
-      txnType,
-      body?.payer?.partyIdInfo?.fspId || reqHeaders['fspiop-source'] || null,
-      body?.payee?.partyIdInfo?.fspId ||
-        reqHeaders['fspiop-destination'] ||
-        process.env.fspId ||
-        null,
-      body?.payer?.partyIdInfo?.partyIdType || null,
-      body?.payer?.partyIdInfo?.partyIdentifier || null,
-      payerName,
-      body?.payee?.partyIdInfo?.partyIdType || null,
-      body?.payee?.partyIdInfo?.partyIdentifier || null,
-      body?.amount?.amount || 0,
-      body?.amount?.currency || process.env.currency || 'BDT',
-    ],
-  );
-}
-
-async function recv_R2_ilpSentToHub({
-  quote_id,
-  ilp_packet,
-  condition_hash,
-  expiration,
-  receive_amount,
-  fee,
-}) {
-  await queryDB(
-    `UPDATE transactions SET
-       status         = 'QUOTE_RECEIVED',
-       receive_amount = ?,
-       fee            = ?,
-       ilp_packet     = ?,
-       condition_hash = ?,
-       expiration     = ?,
-       updated_at     = NOW()
-     WHERE quote_id = ? AND direction = 'INCOMING'`,
-    [
-      receive_amount || null,
-      fee || 0,
-      ilp_packet || null,
-      condition_hash || null,
-      expiration ? new Date(expiration) : null,
-      quote_id,
-    ],
-  );
-}
-
-async function recv_R3_transferReceived(body, reqHeaders) {
-  const transferId = body?.transferId;
-  if (!transferId) return;
-  const byQuote = body?.quoteId
-    ? await queryDB(
-        `SELECT id FROM transactions
-         WHERE quote_id = ? AND direction = 'INCOMING' LIMIT 1`,
-        [body.quoteId],
-      )
-    : [];
-
-  if (byQuote && byQuote.length > 0) {
-    await queryDB(
-      `UPDATE transactions SET
-         transfer_id = ?,
-         status      = 'TRANSFER_SENT',
-         transfer_at = NOW(),
-         updated_at  = NOW()
-       WHERE quote_id = ? AND direction = 'INCOMING'`,
-      [transferId, body.quoteId],
-    );
-  } else {
-    const already = await queryDB(
-      `SELECT id FROM transactions
-       WHERE transfer_id = ? AND direction = 'INCOMING' LIMIT 1`,
-      [transferId],
-    );
-    if (already && already.length > 0) return;
-
-    await queryDB(
-      `INSERT INTO transactions (
-         id, transfer_id, quote_id, transaction_id,
-         type, direction,
-         payer_fsp, payee_fsp,
-         amount, currency,
-         ilp_packet, condition_hash, expiration,
-         status, transfer_at
-       ) VALUES (
-         UUID(), ?, ?, ?,
-         'P2P', 'INCOMING',
-         ?, ?,
-         ?, ?,
-         ?, ?, ?,
-         'TRANSFER_SENT', NOW()
-       )`,
-      [
-        transferId,
-        body?.quoteId || null,
-        body?.transactionId || null,
-        body?.payerFsp || reqHeaders['fspiop-source'] || null,
-        body?.payeeFsp || reqHeaders['fspiop-destination'] || null,
-        body?.amount?.amount || 0,
-        body?.amount?.currency || process.env.currency || 'BDT',
-        body?.ilpPacket || null,
-        body?.condition || null,
-        body?.expiration ? new Date(body.expiration) : null,
-      ],
-    );
-  }
-}
-
-async function recv_R4_finalStatus(transfer_id, newStatus, extra = {}) {
-  const TERMINAL = ['COMMITTED', 'FAILED', 'ABORTED', 'EXPIRED'];
-  try {
-    const rows = await queryDB(
-      `SELECT id, status FROM transactions
-       WHERE transfer_id = ? AND direction = 'INCOMING' LIMIT 1`,
-      [transfer_id],
-    );
-
-    if (!rows || rows.length === 0) {
-      console.warn(
-        `[RECV R4] no INCOMING row found for transfer_id=${transfer_id}`,
-      );
-      return;
-    }
-
-    const row = rows[0];
-
-    if (row.status === newStatus) {
-      return;
-    }
-    if (TERMINAL.includes(row.status)) {
-      return;
-    }
-
-    const fields = ['status = ?', 'updated_at = NOW()'];
-    const values = [newStatus];
-
-    if (newStatus === 'COMMITTED') {
-      fields.push('completed_at = NOW()');
-      if (extra.fulfilment) {
-        fields.push('fulfilment = ?');
-        values.push(extra.fulfilment);
-      }
-    }
-    if (['FAILED', 'ABORTED', 'EXPIRED'].includes(newStatus)) {
-      if (extra.error_code) {
-        fields.push('error_code = ?');
-        values.push(extra.error_code);
-      }
-      if (extra.error_description) {
-        fields.push('error_description = ?');
-        values.push(extra.error_description);
-      }
-    }
-
-    values.push(row.id);
-    await queryDB(
-      `UPDATE transactions SET ${fields.join(', ')} WHERE id = ?`,
-      values,
-    );
-
-    // Balance credit.
-    if (newStatus === 'COMMITTED') {
-      const txnRows = await queryDB(
-        `SELECT merchant_id, amount, fee, currency, transaction_id, type, payer_id_value
-         FROM transactions WHERE id = ? LIMIT 1`,
-        [row.id],
-      );
-      const txn = txnRows?.[0];
-      if (txn?.merchant_id) {
-        await updateBalance({
-          merchant_id: txn.merchant_id,
-          transaction_id: txn.transaction_id,
-          transfer_id,
-          type: 'CREDIT',
-          amount: parseFloat(txn.amount || 0),
-          fee: 0,
-          currency: txn.currency || 'BDT',
-          note: `${txn.type || 'P2P'} received from ${txn.payer_id_value}`,
-        }).catch((e) => console.error('[BALANCE CREDIT]', e.message));
-      }
-    }
-  } catch (err) {
-    console.error('[RECV R4] error:', err.message);
-  }
-}
-// init process
-app.get('/api/verify-parties/:id/:number', async (req, res) => {
+// Verity parties from payee side.
+app.get('/api/verify-parties/:receiver_dfsp/:id/:number', async (req, res) => {
   const id = req.params?.id;
   const number = req.params?.number;
+  const receiver_dfsp = req.params?.receiver_dfsp;
   const url = `${process.env.ALS_SERVICE}/parties/${id}/${number}`;
   const options = {
     method: 'GET',
@@ -1256,7 +1427,7 @@ app.get('/api/verify-parties/:id/:number', async (req, res) => {
         'application/vnd.interoperability.parties+json;version=2.0',
       Accept: 'application/vnd.interoperability.parties+json;version=2.0',
       'FSPIOP-Source': process.env.fspId,
-      'FSPIOP-Destination': process.env.fspDes,
+      'FSPIOP-Destination': receiver_dfsp || process.env.fspDes,
       Authorization: 'Bearer asdfjkl;2e43Asdasa3a34ioaporigniginergk',
       Date: new Date().toUTCString(),
     },
@@ -1264,6 +1435,7 @@ app.get('/api/verify-parties/:id/:number', async (req, res) => {
   await forwardRequestCore(res, url, options);
 });
 
+// Init quote from payer side.
 app.post('/api/init-quotes', async (req, res) => {
   try {
     const { payer_id, payee, amount, type = 'P2P' } = req.body;
@@ -1271,10 +1443,10 @@ app.post('/api/init-quotes', async (req, res) => {
     const transactionId = crypto.randomUUID();
 
     // get the payerfsp merchant data.
+
     const sql = `SELECT * FROM merchant WHERE id = ?`;
     const merchant = await queryDB(sql, [payer_id]);
     if (merchant?.length > 0) {
-      // new
       const TRANSACTION_TYPE_MAP = {
         P2P: {
           scenario: 'TRANSFER',
@@ -1311,7 +1483,7 @@ app.post('/api/init-quotes', async (req, res) => {
       const VALID_TYPES = Object.keys(TRANSACTION_TYPE_MAP);
       const txnType = VALID_TYPES.includes(type) ? type : 'P2P';
       const txnTypeObj = TRANSACTION_TYPE_MAP[txnType];
-      // new
+
       const payer = merchant[0];
       const requestBody = {
         quoteId: quoteId,
@@ -1345,7 +1517,6 @@ app.post('/api/init-quotes', async (req, res) => {
         transactionType: txnTypeObj,
         note: `${txnType} payment initialization.`,
       };
-      //  NEW ->  [SEND S1] - insert OUTGOING row
 
       await send_S1_createQuote({
         quote_id: quoteId,
@@ -1363,10 +1534,10 @@ app.post('/api/init-quotes', async (req, res) => {
         currency: process.env.currency,
         type: txnType,
       }).catch((e) => console.error('[SEND S1]', e.message));
+      // << END >>
       // Prepare Endpoint
       const url = `${process.env.QUOTE_SERVICE}/quotes`;
 
-      // Headers as per FSPIOP spec
       const options = {
         method: 'POST',
         headers: {
@@ -1383,6 +1554,7 @@ app.post('/api/init-quotes', async (req, res) => {
 
       await forwardRequestCore(res, url, options);
     } else {
+      // return error message to dfsp portal.
       res
         .status(400)
         .json({ message: 'Invalid selected merchant ID!', payer_id });
@@ -1396,6 +1568,7 @@ app.post('/api/init-quotes', async (req, res) => {
   }
 });
 
+// Init transfer from payer side.
 app.post('/api/init-transfer', async (req, res) => {
   try {
     const {
@@ -1447,18 +1620,16 @@ app.post('/api/init-transfer', async (req, res) => {
     };
 
     // Prepare headers
+
     const headersPayer = {
       'Content-Type':
-        'application/vnd.interoperability.transfers+json;version=1.0',
-      Accept: 'application/vnd.interoperability.transfers+json;version=1.0',
+        'application/vnd.interoperability.transfers+json;version=2.0',
+      Accept: 'application/vnd.interoperability.transfers+json;version=2.0',
       'FSPIOP-Source': payer_fsp,
-      'FSPIOP-HTTP-Method': 'POST',
       'FSPIOP-Destination': payee_fsp,
+      'FSPIOP-HTTP-Method': 'POST',
       'FSPIOP-URI': '/transfers',
       Date: new Date().toUTCString(),
-      Connection: 'keep-alive',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'User-Agent': 'PostmanRuntime/7.39.0',
     };
 
     const headersPayee = {
@@ -1491,7 +1662,6 @@ app.post('/api/init-transfer', async (req, res) => {
       body: dfspData,
     };
 
-    // NEW -> SEND S3] — link transfer_id, mark TRANSFER_SENT
     await send_S3_transferSent({
       quote_id: quoteId,
       transfer_id: transferId,
@@ -1506,6 +1676,7 @@ app.post('/api/init-transfer', async (req, res) => {
       mlApiResponse: response.data,
     });
   } catch (error) {
+    console.error('Error initiating transfer:', error);
     res.status(500).json({
       success: false,
       message: 'Internal server error',
@@ -1514,10 +1685,10 @@ app.post('/api/init-transfer', async (req, res) => {
   }
 });
 
-// CALLBACK HANDLERS (Parties, Quotes, Transfers)
+///////////////// CALLBACK HANDLERS (Parties, Quotes, Transfers) //////////////////
 
-// Parties Phase
-// # single registration callback PUT method.
+// Parties Phase Callback
+
 app.put('/participants/:partyIdType/:partyIdentifier', async (req, res) => {
   const { partyIdType, partyIdentifier } = req.params;
   const { fspId, currency } = req.body;
@@ -1529,14 +1700,19 @@ app.put('/participants/:partyIdType/:partyIdentifier', async (req, res) => {
       headers: req.headers,
       body: req.body,
     };
-    io.emit('alsRegisterOneCallback', callbackData);
+
+    // check response type
+    if (Array.isArray(req?.body?.partyList)) {
+      io.emit('alsRegisterOneCallback', callbackData);
+    } else {
+      io.emit('alsOracleVerifyCallback', callbackData);
+    }
     res.status(200).send();
   } catch (error) {
     res.status(200).send();
   }
 });
 
-// For FSPIOP_CALLBACK_URL_PARTICIPANT_PUT_ERROR
 app.put(
   '/participants/:partyIdType/:partyIdentifier/error',
   async (req, res) => {
@@ -1548,16 +1724,17 @@ app.put(
         body: req.body,
       };
       // Save to your database
-      io.emit('alsRegisterOneErrorCallback', callbackData);
+      if (req?.body?.errorInformation?.errorDescription == 'Party not found') {
+        io.emit('alsOracleVerifyErrorCallback', callbackData);
+      } else {
+        io.emit('alsRegisterOneErrorCallback', callbackData);
+      }
       res.status(200).send();
     } catch (error) {
-      console.error('Error processing error callback:', error);
       res.status(200).send();
     }
   },
 );
-
-// # multiple registration callback PUT method.
 app.put('/participants/:requestId', async (req, res) => {
   try {
     const callbackData = {
@@ -1574,7 +1751,6 @@ app.put('/participants/:requestId', async (req, res) => {
   }
 });
 
-// For FSPIOP_CALLBACK_URL_PARTICIPANT_BATCH_PUT_ERROR
 app.put('/participants/:requestId/error', async (req, res) => {
   try {
     const callbackData = {
@@ -1592,7 +1768,8 @@ app.put('/participants/:requestId/error', async (req, res) => {
   }
 });
 
-// ALS
+// Account Lookup Service Callback
+
 app.put('/participants/:party_id/:party_identifire', async (req, res) => {});
 
 app.get('/parties/:partyIdType/:partyIdentifier', async (req, res) => {
@@ -1612,74 +1789,10 @@ app.get('/parties/:partyIdType/:partyIdentifier', async (req, res) => {
 
     await processPartyLookup(partyIdType, partyIdentifier, req.headers);
   } catch (error) {
+    console.error('Error in /parties route:', error);
     res.status(202).send();
   }
 });
-
-async function processPartyLookup(partyIdType, partyIdentifier, headers) {
-  try {
-    const sql = `SELECT * FROM merchant WHERE id_type = ? AND id_value = ? AND status = ?`;
-    const merchant = await queryDB(sql, [partyIdType, partyIdentifier, '1']);
-
-    let responseBody;
-    let callbackUrl;
-
-    if (merchant?.length > 0) {
-      if (merchant[0]?.status === '1') {
-        responseBody = {
-          party: {
-            partyIdInfo: {
-              partyIdType,
-              partyIdentifier,
-              fspId: process.env.fspId,
-            },
-            name: merchant[0].display_name || 'Unknown Merchant',
-            personalInfo: {
-              complexName: {
-                firstName: merchant[0].first_name || 'N/A',
-                lastName: merchant[0].last_name || 'N/A',
-              },
-              dateOfBirth: merchant[0].dob || null,
-            },
-          },
-        };
-
-        callbackUrl = `${process.env.ALS_SERVICE}/parties/${partyIdType}/${partyIdentifier}`;
-      } else {
-        responseBody = {
-          errorInformation: {
-            errorCode: '3200',
-            errorDescription: 'Merchant is inactive',
-          },
-        };
-
-        callbackUrl = `${process.env.ALS_SERVICE}/parties/${partyIdType}/${partyIdentifier}/error`;
-      }
-    } else {
-      responseBody = {
-        errorInformation: {
-          errorCode: '3300',
-          errorDescription: 'Merchant not found',
-        },
-      };
-      callbackUrl = `${process.env.ALS_SERVICE}/parties/${partyIdType}/${partyIdentifier}/error`;
-    }
-
-    await sendCallbackToHub(callbackUrl, responseBody, headers);
-  } catch (error) {
-    const errorResponse = {
-      errorInformation: {
-        errorCode: '5000',
-        errorDescription: 'Internal server error processing party lookup',
-      },
-    };
-    await sendCallbackToHub(
-      `${process.env.ALS_SERVICE}/parties/${partyIdType}/${partyIdentifier}/error`,
-      errorResponse,
-      headers,
-    );
-  }
-}
 
 app.put('/parties/:partyIdType/:partyIdentifier', (req, res) => {
   const callbackData = {
@@ -1703,48 +1816,33 @@ app.put('/parties/:partyIdType/:partyIdentifier/error', (req, res) => {
   res.status(200).send();
 });
 
-// Quotes Phase
-async function generateDynamicILPData(ilpData) {
-  // expiration
-  const expirationTime = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-  // Generate a random ILP packet (base64 encoded JSON)
-  const ilpPacket = Buffer.from(JSON.stringify(ilpData)).toString('base64');
-
-  // Generate random condition (32-byte random hash in base64url)
-  const condition = crypto.randomBytes(32).toString('base64url');
-
-  // Return dynamic object
-  return {
-    ilpPacket,
-    condition,
-    expiration: expirationTime,
-  };
-}
+// Quotes Phase Callback
 
 app.post('/quotes', async (req, res) => {
   try {
     const sql = 'SELECT * FROM settings WHERE id = ?';
     const results = await queryDB(sql, [1]);
     const body = req.body;
-    const callbackData = {
+
+    io.emit('postQuoteCallback', {
       params: req.params,
       query: req.query,
       headers: req.headers,
       body: req.body,
-    };
-    io.emit('postQuoteCallback', callbackData);
+    });
+
     res.status(202).send();
-    //  NEW ->  [RECEIVE R1] — insert INCOMING row
+
     await recv_R1_createQuote(body, req.headers).catch((e) =>
-      console.error('[RECV R1]', e.message),
+      console.error('RECV R1', e.message),
     );
 
-    // after that send response to Hub.
     try {
-      let fee = results[0]?.quote_fee;
+      const fee = results[0]?.quote_fee || 0;
       const expirationTime = new Date(
         Date.now() + 60 * 60 * 1000,
       ).toISOString();
+
       const ilpData = {
         amount: body?.amount?.amount,
         currency: body?.amount?.currency,
@@ -1752,10 +1850,18 @@ app.post('/quotes', async (req, res) => {
         payer: { id: body?.payer?.partyIdInfo?.partyIdentifier },
         expiration: expirationTime,
       };
+
       const dynamicILPData = await generateDynamicILPData(ilpData);
       const fee_value = (Number(body?.amount?.amount) / 100) * fee;
       const receive_amount = Number(body?.amount?.amount) - fee_value;
-      const url = `https://quoting.mojaloop.xyz/quotes/${body?.quoteId}`;
+
+      // save fulfilment in database
+      await queryDB(
+        `UPDATE transactions SET fulfilment = ? WHERE quote_id = ? AND direction = 'INCOMING'`,
+        [dynamicILPData.fulfilment, body?.quoteId],
+      ).catch((e) => console.error('[SAVE FULFILMENT]', e.message));
+
+      const url = `${process.env.QUOTE_SERVICE}/quotes/${body?.quoteId}`;
       const headers = {
         'Content-Type':
           'application/vnd.interoperability.quotes+json;version=1.1',
@@ -1764,9 +1870,6 @@ app.post('/quotes', async (req, res) => {
         'FSPIOP-Destination': body?.payer?.partyIdInfo?.fspId,
         'FSPIOP-HTTP-Method': 'PUT',
         'FSPIOP-URI': `/quotes/${body?.quoteId}`,
-        Connection: 'keep-alive',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'User-Agent': 'PostmanRuntime/7.39.0',
       };
 
       const payload = {
@@ -1776,16 +1879,18 @@ app.post('/quotes', async (req, res) => {
         },
         payeeReceiveAmount: {
           currency: body?.amount?.currency,
-          amount: receive_amount,
+          amount: receive_amount.toString(),
         },
-        ...dynamicILPData,
+        ilpPacket: dynamicILPData.ilpPacket,
+        condition: dynamicILPData.condition,
+        expiration: dynamicILPData.expiration,
         extensionList: {
-          extension: [{ key: 'fees', value: fee_value }],
+          extension: [{ key: 'fees', value: fee_value.toString() }],
         },
       };
 
       const response = await axios.put(url, payload, { headers });
-      // NEW -> [RECEIVE R2] — ILP accepted and sent to Hub
+
       await recv_R2_ilpSentToHub({
         quote_id: body?.quoteId,
         ilp_packet: dynamicILPData.ilpPacket || null,
@@ -1794,16 +1899,11 @@ app.post('/quotes', async (req, res) => {
         receive_amount,
         fee: fee_value,
       }).catch((e) => console.error('[RECV R2]', e.message));
-
-      res.json({
-        success: true,
-        message: 'Mojaloop quote PUT successful!',
-        data: response.data,
-      });
     } catch (err) {
-      console.log('e');
+      console.error('[QUOTE PUT ERROR]', err.response?.data || err.message);
     }
   } catch (error) {
+    console.error('[POST /quotes ERROR]', error);
     res.status(202).send();
   }
 });
@@ -1818,7 +1918,6 @@ app.put('/quotes/:id', async (req, res) => {
     body: req.body,
   });
   res.status(200).json({ message: 'Callback received' });
-  // NEW ->  [SEND S2] — store ILP, advance to QUOTE_RECEIVED
   const fee =
     body?.payeeFspFee?.amount ??
     body?.extensionList?.extension?.find((e) => e.key === 'fees')?.value ??
@@ -1841,7 +1940,6 @@ app.put('/quotes/:id/error', async (req, res) => {
     body: req.body,
   });
   res.status(200).json({ message: 'Callback received' });
-  // NEW [SEND] — mark OUTGOING row FAILED
   const errInfo = req.body?.errorInformation || {};
   await queryDB(
     `UPDATE transactions SET
@@ -1858,59 +1956,68 @@ app.put('/quotes/:id/error', async (req, res) => {
   ).catch((e) => console.error('[SEND quote/error]', e.message));
 });
 
-// Transfers Phase
+// Transfers Phase Callback
+
 app.post('/transfers', async (req, res) => {
   try {
-    const callbackData = {
+    const incomingBody = req.body;
+    const transferId = incomingBody?.transferId;
+    const completedTimestamp = new Date().toISOString();
+
+    io.emit('postTransferCallback', {
       params: req.params,
       query: req.query,
       headers: req.headers,
       body: req.body,
-    };
+    });
 
-    // Socket emit
-    io.emit('postTransferCallback', callbackData);
-
-    // HERE //
-    const incomingBody = req.body;
-    const transferId =
-      incomingBody?.transferId || '4a4d99d4-0e07-437f-986a-a443d214449a';
-    const completedTimestamp = new Date().toISOString();
-    // NEW [RECEIVE R3] — link transfer_id to INCOMING row
     await recv_R3_transferReceived(incomingBody, req.headers).catch((e) =>
-      console.error('[RECV R3]', e.message),
+      console.error('RECV R3', e.message),
     );
+
+    // get correct fulfilment from db
+    const txnRows = await queryDB(
+      `SELECT fulfilment FROM transactions WHERE quote_id = ? AND direction = 'INCOMING' LIMIT 1`,
+      [incomingBody?.quoteId],
+    );
+    const fulfilment =
+      txnRows?.[0]?.fulfilment || crypto.randomBytes(32).toString('base64url');
 
     const url = `${process.env.ML_API_ADAPTER}/transfers/${transferId}`;
     const headers = {
       'Content-Type':
-        'application/vnd.interoperability.transfers+json;version=1.0',
-      Accept: 'application/vnd.interoperability.transfers+json;version=1.0',
-      'FSPIOP-Source': `${process.env.FSP_ID || 'SELFFSPID'}`,
-      'FSPIOP-Destination': `${process.env.FSP_DES || 'DESTFSPID'}`,
+        'application/vnd.interoperability.transfers+json;version=2.0',
+      Accept: 'application/vnd.interoperability.transfers+json;version=2.0',
+      'FSPIOP-Source':
+        incomingBody?.payeeFsp ||
+        req.headers['fspiop-destination'] ||
+        process.env.fspId,
+      'FSPIOP-Destination':
+        incomingBody?.payerFsp || req.headers['fspiop-source'],
       'FSPIOP-HTTP-Method': 'PUT',
       'FSPIOP-URI': `/transfers/${transferId}`,
       Date: new Date().toUTCString(),
     };
+
     const body = {
-      completedTimestamp: completedTimestamp,
+      completedTimestamp,
       transferState: 'COMMITTED',
+      fulfilment,
     };
+
+    console.log('[POST /transfers] PUT body:', JSON.stringify(body));
     await axios.put(url, body, { headers });
 
-    //***  HERE  ***//
-
-    // NEW  [RECEIVE R4] — Hub accepted our COMMITTED, close INCOMING row
-    await recv_R4_finalStatus(transferId, 'COMMITTED').catch((e) =>
-      console.error('[RECV R4]', e.message),
+    await recv_R4_finalStatus(transferId, 'COMMITTED', { fulfilment }).catch(
+      (e) => console.error('RECV R4', e.message),
     );
-    // << END >>
-    // Send response ONCE
-    res.status(202).json({
-      message: 'Callback received successfully',
-    });
+
+    res.status(202).json({ message: 'Callback received successfully' });
   } catch (error) {
-    // NEW -> [RECEIVE R4] — our PUT to Hub failed, mark INCOMING FAILED
+    console.error(
+      '[POST /transfers ERROR]',
+      error.response?.data || error.message,
+    );
     const tid = req.body?.transferId;
     if (tid) {
       await recv_R4_finalStatus(tid, 'FAILED', {
@@ -1918,13 +2025,12 @@ app.post('/transfers', async (req, res) => {
         error_description: error.message,
       }).catch(() => {});
     }
-
-    res.status(202).json({
-      message: 'Callback received with errors',
-      error: error.message,
-    });
+    res
+      .status(202)
+      .json({ message: 'Callback received with errors', error: error.message });
   }
 });
+
 app.post('/transfers/:id', async (req, res) => {
   try {
     const callbackData = {
@@ -1937,35 +2043,10 @@ app.post('/transfers/:id', async (req, res) => {
     res.status(202).send();
     await processTransferRequest(req.body, req.headers);
   } catch (error) {
+    console.error('Error in /transfers route:', error);
     res.status(202).send();
   }
 });
-
-async function processTransferRequest(transferData, headers) {
-  try {
-    const responseBody = {
-      completedTimestamp: new Date().toISOString(),
-      transferState: 'COMMITTED',
-    };
-    await sendCallbackToHub(
-      `${process.env.ML_API_ADAPTER}/transfers/${transferData.transferId}`,
-      responseBody,
-      headers,
-    );
-  } catch (error) {
-    const errorResponse = {
-      errorInformation: {
-        errorCode: '5000',
-        errorDescription: 'Internal server error processing transfer',
-      },
-    };
-    await sendCallbackToHub(
-      `${process.env.ML_API_ADAPTER}/transfers/${transferData.transferId}/error`,
-      errorResponse,
-      headers,
-    );
-  }
-}
 
 app.put('/transfers/:id', async (req, res) => {
   const body = req.body;
@@ -1978,7 +2059,6 @@ app.put('/transfers/:id', async (req, res) => {
     body: req.body,
   });
   res.status(200).json({ message: 'Callback received' });
-  // NEW -> [SEND S4] — close OUTGOING row, unique tracker skips if terminal
   const newStatus =
     body?.transferState === 'COMMITTED'
       ? 'COMMITTED'
@@ -2003,7 +2083,6 @@ app.put('/transfers/:id/error', (req, res) => {
     body: req.body,
   });
   res.status(200).json({ message: 'Callback received' });
-  // NEW -> [SEND S4] — close OUTGOING row as FAILED
   const errInfo = body?.errorInformation || {};
   send_S4_finalStatus(transferId, 'FAILED', {
     error_code: errInfo.errorCode ?? null,
@@ -2011,537 +2090,6 @@ app.put('/transfers/:id/error', (req, res) => {
   }).catch((e) => console.error('[SEND S4 error]', e.message));
 });
 
-// ALL Bulk
-app.post('/api/verify-bulk-parties', async (req, res) => {
-  try {
-    const parties = req.body;
-
-    if (!parties) return res.status(401).json({ message: 'asdf' });
-
-    if (!parties || !Array.isArray(parties)) {
-      return res.status(400).json({
-        success: false,
-        message: 'parties must be an array',
-        data: parties || 'N/A',
-      });
-    }
-
-    const results = await Promise.allSettled(
-      parties.map(async (party) => {
-        const url = `${process.env.ALS_SERVICE}/parties/${party.idType}/${party.identifier}`;
-
-        const response = await axios.get(url, {
-          headers: {
-            'Content-Type':
-              'application/vnd.interoperability.parties+json;version=2.0',
-            Accept: 'application/vnd.interoperability.parties+json;version=2.0',
-            'FSPIOP-Source': process.env.fspId,
-            Date: new Date().toUTCString(),
-          },
-        });
-
-        return {
-          party,
-          found: true,
-          details: response.data,
-        };
-      }),
-    );
-
-    const verified = results.map((result, index) => {
-      if (result.status === 'fulfilled') {
-        return result.value;
-      } else {
-        return {
-          party: parties[index],
-          found: false,
-          error: result.reason.message,
-        };
-      }
-    });
-
-    res.status(200).json({
-      success: true,
-      total: parties.length,
-      found: verified.filter((v) => v.found).length,
-      not_found: verified.filter((v) => !v.found).length,
-      results: verified,
-    });
-  } catch (error) {
-    console.error('error verifying bulk parties:', error);
-    res.status(500).json({
-      success: false,
-      message: error.message,
-    });
-  }
-});
-
-// BULK QUOTES CALLBACK
-// 1. Bulk Quote Success Callback
-app.put('/bulkQuotes/:bulkQuoteId', async (req, res) => {
-  try {
-    const { bulkQuoteId } = req.params;
-    const bulkQuoteResponse = req.body;
-
-    // Extract individual quote responses
-    const individualQuoteResults =
-      bulkQuoteResponse.individualQuoteResults || [];
-
-    // Emit to frontend via Socket.io
-    const callbackData = {
-      params: req.params,
-      headers: req.headers,
-      body: req.body,
-    };
-
-    io.emit('putBulkQuoteCallback', callbackData);
-
-    res.status(200).json({
-      message: 'Bulk quote callback received',
-      bulkQuoteId,
-    });
-  } catch (error) {
-    res.status(200).json({ message: 'Callback received with error' });
-  }
-});
-
-// 2. Bulk Quote Error Callback
-app.put('/bulkQuotes/:bulkQuoteId/error', async (req, res) => {
-  try {
-    const { bulkQuoteId } = req.params;
-    const errorInfo = req.body.errorInformation;
-
-    // Emit to frontend
-    io.emit('putBulkQuoteCallbackError', {
-      params: req.params,
-      headers: req.headers,
-      body: req.body,
-    });
-    res.status(200).json({ message: 'Error callback received' });
-  } catch (error) {
-    console.error('Error handling bulk quote error:', error);
-    res.status(200).json({ message: 'Error callback received' });
-  }
-});
-
-// BULK TRANSFER CALLBACK HANDLERS
-// 3. Bulk Transfer Success Callback
-app.put('/bulkTransfers/:bulkTransferId', async (req, res) => {
-  try {
-    const { bulkTransferId } = req.params;
-    const bulkTransferResponse = req.body;
-
-    const individualTransferResults =
-      bulkTransferResponse.individualTransferResults || [];
-
-    // Emit to frontend
-    io.emit('putBulkTransferCallback', {
-      params: req.params,
-      headers: req.headers,
-      body: req.body,
-    });
-
-    // Update bulk disbursement
-    const completedCount = individualTransferResults.filter(
-      (r) => r.transferState === 'COMMITTED',
-    ).length;
-
-    const allCompleted = completedCount === individualTransferResults.length;
-
-    res.status(200).json({
-      message: 'Bulk transfer callback received',
-      bulkTransferId,
-      completed: completedCount,
-      total: individualTransferResults.length,
-    });
-  } catch (error) {
-    res.status(200).json({ message: 'Callback received with error' });
-  }
-});
-
-// 4. Bulk Transfer Error Callback
-app.put('/bulkTransfers/:bulkTransferId/error', async (req, res) => {
-  try {
-    const { bulkTransferId } = req.params;
-    const errorInfo = req.body.errorInformation;
-
-    // Emit to frontend
-    io.emit('putBulkTransferCallbackError', {
-      params: req.params,
-      headers: req.headers,
-      body: req.body,
-    });
-
-    res.status(200).json({ message: 'Error callback received' });
-  } catch (error) {
-    console.error('Error handling bulk transfer error:', error);
-    res.status(200).json({ message: 'Error callback received' });
-  }
-});
-
-// Real function.
-app.post('/api/init-bulk-quotes', async (req, res) => {
-  try {
-    const { payer_id, recipients, amount_per_recipient, disbursement_type } =
-      req.body;
-
-    if (!payer_id || !recipients || !Array.isArray(recipients)) {
-      return res.status(400).json({
-        success: false,
-        message: 'Missing required fields: payer_id, recipients',
-      });
-    }
-
-    const bulkQuoteId = crypto.randomUUID();
-
-    const sql = `SELECT * FROM merchant WHERE id = ?`;
-    const merchant = await queryDB(sql, [payer_id]);
-
-    if (!merchant || merchant.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: 'Invalid payer ID',
-      });
-    }
-
-    const payer = merchant[0];
-
-    const individualQuotes = recipients.map((recipient) => {
-      const quoteId = crypto.randomUUID();
-      const transactionId = crypto.randomUUID();
-
-      return {
-        quoteId,
-        transactionId,
-        payee: {
-          partyIdInfo: {
-            partyIdType: recipient.partyIdType || 'MSISDN',
-            partyIdentifier: recipient.partyIdentifier,
-            fspId: recipient.fspId,
-          },
-        },
-        amountType: 'SEND',
-        amount: {
-          amount: (recipient?.amount || amount_per_recipient).toString(),
-          currency: process.env.currency || 'BDT',
-        },
-        transactionType: {
-          scenario: 'TRANSFER',
-          initiator: 'PAYER',
-          initiatorType: 'CONSUMER',
-        },
-        note: recipient.note || 'Bulk payment',
-      };
-    });
-
-    const totalAmount = individualQuotes.reduce(
-      (sum, q) => sum + parseFloat(q.amount.amount),
-      0,
-    );
-    // Construct bulk quote request
-    const requestBody = {
-      bulkQuoteId,
-      payer: {
-        partyIdInfo: {
-          partyIdType: payer.id_type,
-          partyIdentifier: payer.id_value,
-          fspId: process.env.fspId,
-        },
-        personalInfo: {
-          complexName: {
-            firstName: payer.first_name,
-            lastName: payer.last_name,
-          },
-          dateOfBirth: payer.dob,
-        },
-      },
-      expiration: new Date(Date.now() + 10 * 60 * 1000).toISOString(),
-      individualQuotes,
-    };
-
-    // Send to Mojaloop Bulk API
-    const url = `${process.env.QUOTE_SERVICE}/bulkQuotes`;
-
-    const options = {
-      method: 'POST',
-      headers: {
-        'Content-Type':
-          'application/vnd.interoperability.bulkQuotes+json;version=1.0',
-        Accept: 'application/vnd.interoperability.bulkQuotes+json;version=1.0',
-        'FSPIOP-Source': process.env.fspId || 'SELFFSPID',
-        'FSPIOP-Destination': process.env.fspDes || 'DESFSPID',
-        'FSPIOP-HTTP-Method': 'POST',
-        'FSPIOP-URI': '/bulkQuotes',
-        Date: new Date().toUTCString(),
-      },
-      body: JSON.stringify(requestBody),
-    };
-
-    // Forward request
-    await forwardRequestCore(res, url, options);
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: error.message,
-    });
-  }
-});
-
-app.post('/bulkQuotes', async (req, res) => {
-  try {
-    const bulkQuoteRequest = req.body;
-    const { bulkQuoteId, payer, individualQuotes, expiration } =
-      bulkQuoteRequest;
-
-    // Emit to frontend
-    io.emit('postBulkQuoteCallback', {
-      params: req.params,
-      headers: req.headers,
-      body: req.body,
-    });
-
-    res.status(202).send();
-
-    const individualQuoteResults = [];
-    const exp = new Date(Date.now() + 60 * 60 * 1000).toISOString();
-    for (const quote of individualQuotes) {
-      try {
-        // Get fee settings
-        const sql = 'SELECT * FROM settings WHERE id = ?';
-        const settings = await queryDB(sql, [1]);
-        const fee = settings[0]?.quote_fee || 1;
-
-        // Calculate amounts
-        const amount = parseFloat(quote.amount.amount);
-        const fee_value = (amount / 100) * fee;
-        const receive_amount = amount - fee_value;
-
-        // Generate ILP data
-        const ilpData = {
-          amount: quote.amount.amount,
-          currency: quote.amount.currency,
-          payee: { id: quote.payee.partyIdInfo.partyIdentifier },
-          payer: { id: payer.partyIdInfo.partyIdentifier },
-          expiration: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
-        };
-
-        const dynamicILPData = await generateDynamicILPData(ilpData);
-
-        individualQuoteResults.push({
-          quoteId: quote.quoteId,
-          transferAmount: {
-            currency: quote.amount.currency,
-            amount: quote.amount.amount,
-          },
-          payeeReceiveAmount: {
-            currency: quote.amount.currency,
-            amount: receive_amount.toString(),
-          },
-          payeeFspFee: {
-            currency: quote.amount.currency,
-            amount: fee_value.toString(),
-          },
-          ilpPacket: dynamicILPData.ilpPacket,
-          condition: dynamicILPData.condition,
-          expiration: dynamicILPData.expiration,
-        });
-      } catch (error) {
-        // Add error response for this quote
-        individualQuoteResults.push({
-          quoteId: quote.quoteId,
-          errorInformation: {
-            errorCode: '5000',
-            errorDescription: error.message,
-          },
-        });
-      }
-    }
-
-    // Send bulk quote response back to Hub
-    const url = `${process.env.QUOTE_SERVICE}/bulkQuotes/${bulkQuoteId}`;
-
-    const headers = {
-      'Content-Type':
-        'application/vnd.interoperability.bulkQuotes+json;version=1.0',
-      Date: new Date().toUTCString(),
-      'FSPIOP-Source': process.env.fspId,
-      'FSPIOP-Destination': payer.partyIdInfo.fspId,
-      'FSPIOP-HTTP-Method': 'PUT',
-      'FSPIOP-URI': `/bulkQuotes/${bulkQuoteId}`,
-    };
-
-    const payload = {
-      individualQuoteResults: individualQuoteResults,
-      expiration: expiration,
-    };
-
-    const response = await axios.put(url, payload, { headers });
-  } catch (error) {
-    res.status(202).send();
-  }
-});
-
-// Transfers phase
-// PAYER SIDE: Initialize Bulk Transfer
-app.post('/api/init-bulk-transfer', async (req, res) => {
-  try {
-    const { bulkQuoteId, payerFsp, payeeFsp, individualTransfers } = req.body;
-
-    if (
-      !bulkQuoteId ||
-      !payerFsp ||
-      !payeeFsp ||
-      !individualTransfers ||
-      !Array.isArray(individualTransfers)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          'Missing required fields: bulkQuoteId, payerFsp, payeeFsp, individualTransfers',
-      });
-    }
-    const bulkTransferId = crypto.randomUUID();
-
-    // Build request body with REQUIRED extensionList
-    const requestBody = {
-      bulkTransferId: bulkTransferId,
-      bulkQuoteId: bulkQuoteId,
-      payerFsp: payerFsp,
-      payeeFsp: payeeFsp,
-      individualTransfers: individualTransfers.map((transfer, index) => {
-        // Build base transfer
-        const baseTransfer = {
-          transferId: transfer.transferId || crypto.randomUUID(),
-          transferAmount: {
-            currency:
-              transfer.currency || transfer.transferAmount?.currency || 'BDT',
-            amount: (
-              transfer.amount || transfer.transferAmount?.amount
-            ).toString(),
-          },
-          ilpPacket: transfer.ilpPacket,
-          condition: transfer.condition,
-        };
-
-        if (transfer.extensionList) {
-          // User provided extension list
-          baseTransfer.extensionList = transfer.extensionList;
-        } else {
-          baseTransfer.extensionList = {
-            extension: [
-              {
-                key: 'transferIndex',
-                value: index.toString(),
-              },
-            ],
-          };
-        }
-
-        return baseTransfer;
-      }),
-      expiration: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
-    };
-
-    const headers = {
-      Accept: 'application/vnd.interoperability.bulkTransfers+json;version=1.0',
-      'Content-Type':
-        'application/vnd.interoperability.bulkTransfers+json;version=1.0',
-      'FSPIOP-Source': payerFsp,
-      'FSPIOP-Destination': payeeFsp,
-      Date: new Date().toUTCString(),
-    };
-
-    const url = `${process.env.BULK_API_ADAPTER}/bulkTransfers`;
-
-    // Send to Hub
-    const response = await axios.post(url, requestBody, { headers });
-
-    // Response
-    res.status(200).json({
-      success: true,
-      message: 'Bulk transfer initiated',
-      bulkTransferId: bulkTransferId,
-      bulkQuoteId: bulkQuoteId,
-      payeeFsp: payeeFsp,
-      transferCount: individualTransfers.length,
-      hubResponse: response.data,
-    });
-  } catch (error) {
-    if (error.response) {
-      console.error('   Response status:', error.response.status);
-      console.error('   Response data:', error.response.data);
-    }
-
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: error.response?.data || error.message,
-    });
-  }
-});
-
-app.post('/bulkTransfers', async (req, res) => {
-  try {
-    res.status(202).send();
-
-    const { bulkTransferId, payerFsp, payeeFsp, individualTransfers } =
-      req.body;
-
-    const completedTimestamp = new Date().toISOString();
-
-    const individualTransferResults = individualTransfers.map((t) => ({
-      transferId: t.transferId,
-      transferState: 'COMMITTED',
-      completedTimestamp: completedTimestamp,
-      fulfilment: crypto.randomBytes(32).toString('base64url'),
-    }));
-
-    const hubUrl = `${process.env.BULK_API_ADAPTER}/bulkTransfers/${bulkTransferId}`;
-
-    const headers = {
-      'Content-Type':
-        'application/vnd.interoperability.bulkTransfers+json;version=1.0',
-      Accept: 'application/vnd.interoperability.bulkTransfers+json;version=1.0',
-      'FSPIOP-Source': payeeFsp,
-      'FSPIOP-Destination': payerFsp,
-      Date: new Date().toUTCString(),
-    };
-
-    await axios.put(
-      hubUrl,
-      {
-        bulkTransferState: 'COMPLETED',
-        individualTransferResults,
-      },
-      { headers },
-    );
-  } catch (err) {
-    if (err.response) {
-      console.error('   Hub error:', err.response.data);
-    }
-  }
-});
-
-// helper function.
-function validateILPPacket(ilpPacket, condition) {
-  try {
-    if (!ilpPacket || !condition) return false;
-
-    const decoded = Buffer.from(ilpPacket, 'base64').toString();
-    const packet = JSON.parse(decoded);
-
-    return packet && packet.amount;
-  } catch (error) {
-    return false;
-  }
-}
-
-function generateFulfilment(condition) {
-  return crypto.randomBytes(32).toString('base64url');
-}
-
-// app
 const PORT = process.env.PORT || 5002;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
