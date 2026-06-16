@@ -1,4 +1,4 @@
-# B Bank — Mojaloop DFSP
+# B Bank - Mojaloop DFSP
 
 A production-grade **Digital Financial Service Provider (DFSP)** backend built on the [Mojaloop](https://mojaloop.io/) open-source real-time payment framework. B Bank acts as a participant FSP within a Mojaloop switch, handling merchant onboarding, party lookups, quote negotiation, and transfer execution — with full callback handling for both payer and payee flows.
 
@@ -94,20 +94,20 @@ The system supports multiple payment rails: `P2P`, `INSTANT`, `BULK`, `NPSB`, `R
 Copy `.env.example` to `.env` and fill in all values:
 
 ```dotenv
-# ── Database ──────────────────────────────────────────────
+#  Database 
 HOST=localhost
 USER=root
 PASSWORD=your_db_password
 PORT=5004
 DATABASE=moja_dfsp_2
 
-# ── JWT ───────────────────────────────────────────────────
+#  JWT 
 JWT_SECRET=your_jwt_secret
 JWT_EXPIRES_IN=365d
 JWT_REFRESH_SECRET=your_refresh_secret
 JWT_REFRESH_EXPIRES_IN=365d
 
-# ── Mojaloop Core Services ────────────────────────────────
+#  Mojaloop Core Services 
 ALS_ADMIN_SERVICE=https://your-als-admin-domain.com
 ALS_SERVICE=https://your-als-domain.com
 CENTRAL_LEDGER=https://your-ledger-domain.com
@@ -115,18 +115,18 @@ ML_API_ADAPTER=https://your-ml-api-adapter-domain.com
 QUOTE_SERVICE=https://your-quoting-service-domain.com
 SETTLEMENT=https://your-settlement-domain.com
 
-# ── App ───────────────────────────────────────────────────
+#  App 
 NODE_ENV=development
 SERVER_URL=https://your-server-url.com
 PORT=5002
 
-# ── SMTP ──────────────────────────────────────────────────
+#  SMTP 
 SMTP_HOST=smtp.example.com
 SMTP_USER=noreply@example.com
 SMTP_PASS=your_smtp_password
 SMTP_FROM=noreply@example.com
 
-# ── FSP Identity ──────────────────────────────────────────
+#  FSP Identity 
 fspId=SELFFSPID          # This DFSP's FSP ID registered in Mojaloop
 fspDes=DESTFSPID         # Default destination FSP ID
 currency=BDT             # Default currency
@@ -602,4 +602,4 @@ B Bank follows defensive patterns throughout:
 
 ## License
 
-Private — Bangladeshi Software LTD. All rights reserved.
+Private - Bangladeshi Software LTD. All rights reserved.
