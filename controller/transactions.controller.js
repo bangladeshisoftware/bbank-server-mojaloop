@@ -1,3 +1,10 @@
+/**************************************************************************
+ * Copyright © 2026 Bangladeshi Software Ltd. All rights reserved.
+ * Distributed under the license terms specified in this repository.
+ *
+ * ORIGINAL AUTHOR: Muhammad Nasim (Developer)
+ **************************************************************************/
+
 const db = require('../utils/db');
 const { pool } = require('../config/db');
 
@@ -97,7 +104,7 @@ const getTransactions = async (req, res) => {
     const total = countResult[0]?.total || 0;
     const total_pages = Math.ceil(total / limit);
 
-    // Fetch paginated rows 
+    // Fetch paginated rows
     const dataSQL = `
       SELECT
         t.id,

@@ -1,3 +1,10 @@
+/**************************************************************************
+ * Copyright © 2026 Bangladeshi Software Ltd. All rights reserved.
+ * Distributed under the license terms specified in this repository.
+ *
+ * ORIGINAL AUTHOR: Muhammad Nasim (Developer)
+ **************************************************************************/
+
 const fs = require('fs');
 const crypto = require('crypto');
 const base64url = require('base64url');
@@ -14,7 +21,14 @@ try {
   console.error('Error loading private keys:', error.message);
 }
 
-function generateJWSSignature(body, httpMethod, uri, source, destination, date) {
+function generateJWSSignature(
+  body,
+  httpMethod,
+  uri,
+  source,
+  destination,
+  date,
+) {
   try {
     // Select private key
     let privateKey;
@@ -32,12 +46,12 @@ function generateJWSSignature(body, httpMethod, uri, source, destination, date) 
 
     // Create protected header
     const protectedHeader = {
-      alg: "RS256",
-      "FSPIOP-URI": uri,
-      "FSPIOP-HTTP-Method": httpMethod,
-      "FSPIOP-Source": source,
-      "FSPIOP-Destination": destination,
-      "Date": date
+      alg: 'RS256',
+      'FSPIOP-URI': uri,
+      'FSPIOP-HTTP-Method': httpMethod,
+      'FSPIOP-Source': source,
+      'FSPIOP-Destination': destination,
+      Date: date,
     };
 
     const encodedProtectedHeader = base64url(JSON.stringify(protectedHeader));
@@ -54,21 +68,20 @@ function generateJWSSignature(body, httpMethod, uri, source, destination, date) 
     const sign = crypto.createSign('RSA-SHA256');
     sign.update(signingInput);
     sign.end();
-    
+
     const signature = sign.sign(privateKey);
     const encodedSignature = base64url(signature);
 
     const jwsSignature = JSON.stringify({
       signature: encodedSignature,
-      protectedHeader: encodedProtectedHeader
+      protectedHeader: encodedProtectedHeader,
     });
 
     console.log(`JWS Signature generated for ${source}`);
-    
-    return jwsSignature;
 
+    return jwsSignature;
   } catch (error) {
-    console.error("Error generating JWS signature:", error.message);
+    console.error('Error generating JWS signature:', error.message);
     throw error;
   }
 }

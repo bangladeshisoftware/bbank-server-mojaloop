@@ -1,3 +1,10 @@
+/**************************************************************************
+ * Copyright © 2026 Bangladeshi Software Ltd. All rights reserved.
+ * Distributed under the license terms specified in this repository.
+ *
+ * ORIGINAL AUTHOR: Muhammad Nasim (Developer)
+ **************************************************************************/
+
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
@@ -273,7 +280,6 @@ exports.getMe = async (req, res) => {
   }
 };
 
-
 exports.updateMe = async (req, res) => {
   try {
     const { full_name, phone } = req.body;
@@ -289,7 +295,6 @@ exports.updateMe = async (req, res) => {
     return res.status(500).json({ error: 'Internal server error' });
   }
 };
-
 
 exports.changePassword = async (req, res) => {
   try {
@@ -600,27 +605,29 @@ exports.getProfile = async (req, res) => {
       const [[sum]] = await pool.execute(
         `SELECT COALESCE(SUM(balance), 0) AS total_balance,
                 COUNT(*) AS total_merchants
-         FROM merchant_wallet`
+         FROM merchant_wallet`,
       );
 
       const [[user]] = await pool.execute(
         `SELECT username, email, full_name FROM users WHERE id = ?`,
-        [id]
+        [id],
       );
 
       return res.json({
-        role:             'ADMIN',
-        username:         user?.username,
-        full_name:        user?.full_name,
-        email:            user?.email,
-        total_balance:    parseFloat(sum.total_balance   || 0),
-        total_merchants:  parseInt(sum.total_merchants   || 0),
-        currency:         'BDT',
+        role: 'ADMIN',
+        username: user?.username,
+        full_name: user?.full_name,
+        email: user?.email,
+        total_balance: parseFloat(sum.total_balance || 0),
+        total_merchants: parseInt(sum.total_merchants || 0),
+        currency: 'BDT',
       });
     }
 
     if (!merchant_id)
-      return res.status(400).json({ error: 'No merchant linked to this account' });
+      return res
+        .status(400)
+        .json({ error: 'No merchant linked to this account' });
 
     const [[row]] = await pool.execute(
       `SELECT w.balance, w.currency,
@@ -628,20 +635,19 @@ exports.getProfile = async (req, res) => {
        FROM merchant_wallet w
        JOIN merchant m ON m.id = w.merchant_id
        WHERE w.merchant_id = ?`,
-      [merchant_id]
+      [merchant_id],
     );
 
     return res.json({
-      role:         'MERCHANT',
+      role: 'MERCHANT',
       merchant_id,
       display_name: row?.display_name,
-      id_type:      row?.id_type,
-      id_value:     row?.id_value,
-      status:       row?.status,
-      balance:      parseFloat(row?.balance  || 0),
-      currency:     row?.currency || 'BDT',
+      id_type: row?.id_type,
+      id_value: row?.id_value,
+      status: row?.status,
+      balance: parseFloat(row?.balance || 0),
+      currency: row?.currency || 'BDT',
     });
-
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

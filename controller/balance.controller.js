@@ -1,3 +1,10 @@
+/**************************************************************************
+ * Copyright © 2026 Bangladeshi Software Ltd. All rights reserved.
+ * Distributed under the license terms specified in this repository.
+ *
+ * ORIGINAL AUTHOR: Muhammad Nasim (Developer)
+ **************************************************************************/
+
 const { pool } = require('../config/db');
 
 exports.updateBalance = async ({
@@ -20,11 +27,11 @@ exports.updateBalance = async ({
       `INSERT INTO merchant_wallet
          (merchant_id, user_id, balance, total_credit, total_debit, total_fee, currency)
        VALUES (?, ?, 0, 0, 0, 0, ?)
-       ON DUPLICATE KEY UPDATE merchant_id = merchant_id`, 
+       ON DUPLICATE KEY UPDATE merchant_id = merchant_id`,
       [merchant_id, user_id, currency],
     );
 
-    // 2. Lock wallet row & get current balance 
+    // 2. Lock wallet row & get current balance
     const [[wallet]] = await conn.execute(
       `SELECT balance FROM merchant_wallet
        WHERE merchant_id = ? FOR UPDATE`,
