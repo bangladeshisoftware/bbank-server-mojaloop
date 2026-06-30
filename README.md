@@ -164,6 +164,33 @@ The server starts on `PORT` (default `5002`). WebSocket listens on the same port
 
 ---
 
+---
+
+### Default Login Setup
+
+Before using the default credentials, update the default user's email address in your database so the OTP can be delivered to a valid email.
+
+**Users Table**
+
+Replace the default email with your own email address.
+
+**Example:**
+
+| Field | Value |
+|-------|-------|
+| Email | `your-email@example.com` |
+
+After updating the email, log in using the default credentials:
+
+| Username | Password |
+|----------|----------|
+| `admin` | `admin` |
+
+> **Note**
+> The OTP will be sent to the email address configured in the `users` table.
+
+---
+
 ## Mojaloop Flow — End to End
 
 B Bank implements the full three-phase Mojaloop FSPIOP flow:
