@@ -189,7 +189,7 @@ background-image: linear-gradient(120deg, #a1c4fd 0%, #c2e9fb 100%);
         </p>
 
         <p class="info">
-          We received a request to access your secure R Switch Portal account.
+          We received a request to access your secure NB Switch Portal account.
           Please use the one-time password (OTP) below to complete your authentication.
         </p>
 
@@ -253,7 +253,7 @@ async function sendSettlementEmail({ to, dfspName, dfspId, settlementData }) {
         })
       : 'N/A';
 
-  const subject = `[R Switch] Settlement Completed — ${dfspId} | ID: ${settlementId}`;
+  const subject = `[NB Switch] Settlement Completed — ${dfspId} | ID: ${settlementId}`;
 
   const html = `
 <!DOCTYPE html>
@@ -310,7 +310,7 @@ async function sendSettlementEmail({ to, dfspName, dfspId, settlementData }) {
       <div class="hdr-icon">⬡</div>
       <div>
         <h1>Settlement Completed</h1>
-        <p>R Switch Portal — Mojaloop Financial Switch</p>
+        <p>NB Switch Portal — Mojaloop Financial Switch</p>
       </div>
     </div>
 
@@ -389,13 +389,13 @@ async function sendSettlementEmail({ to, dfspName, dfspId, settlementData }) {
         <p>
           Position has been reset to 0 after settlement.<br>
           A new settlement window is now open for the next period.<br>
-          For any queries, contact the R Switch operations team.
+          For any queries, contact the NB Switch operations team.
         </p>
       </div>
     </div>
 
     <div class="footer">
-      R Switch Portal &nbsp;·&nbsp; Automated Settlement Notification &nbsp;·&nbsp; Do not reply<br>
+      NB Switch Portal &nbsp;·&nbsp; Automated Settlement Notification &nbsp;·&nbsp; Do not reply<br>
       ${new Date().getFullYear()} © Mojaloop Financial Switch
     </div>
   </div>
